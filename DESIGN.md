@@ -146,14 +146,117 @@ Agent 측에는 **만료 검사 코드가 없다.** 배달된 명령은 곧 "만
 
 ## 5. 보안 (인증 · 인가)
 
-### 5.1 인증
-Mosquitto `password_file` 기반 계정 분리. 계정은 Agent별 1개 + 컨트롤러 1개.
+### 5.1 인증 — 자격증명 생성과 관리
+
+Mosquitto `password_file` 기반 계정 분리.
+
+| 계정 | 수 | 권한 | 주입 대상 |
+|---|---|---|---|
+| `central` | 1 | `topic write cmd/#` — **300대 전체 명령 권한** | Python 중앙서버 |
+| `agent-NNN` | 300 | 자기 토픽만 (`%u` 치환) | 각 Agent 호스트 |
+| `ops` | 1 | 상태·`$SYS` 읽기 | 운영자 단말 |
+| `health` | 1 | `$SYS/broker/uptime` 만 | docker healthcheck |
+
+**Agent별 계정은 타협 불가**다. §5.2 ACL이 `%u`(접속 username) 치환에 의존하므로, 계정을 공유하면 `pattern read cmd/%u/req` 가 모두 같은 토픽으로 풀려 **아무 Agent나 남의 명령을 구독**할 수 있다. 토픽 격리가 통째로 무너진다.
+
+#### 생성 주체 — 브로커가 아니다
+
+Mosquitto에는 계정 발급·등록 API가 없다. Agent가 "계정을 달라"고 요청하는 흐름은 존재하지 않는다. **운영자(또는 배포 파이프라인)가 오프라인에서 만들어 뿌린다.**
 
 ```
-central   : 컨트롤러 전용
-agent-001 : Agent 전용
-agent-002 : ...
+[운영자]
+  ├─ openssl rand ─▶ 평문 비밀번호
+  │                    ├─▶ mosquitto_passwd ─▶ password_file (해시)  → 브로커
+  │                    └─▶ Agent 설정파일 (평문)                      → Agent 호스트
+  └─ SIGHUP ────────────────────────────────────────────────────────▶ 브로커 재읽기
 ```
+
+해시와 평문이 **서로 다른 경로로** 나간다. 브로커는 평문을 가진 적이 없고, 발급한 적도 없다. `mosquitto_passwd` 는 브로커 데몬과 별개의 CLI이며 브로커가 떠 있지 않아도 동작한다.
+
+#### 일괄 생성
+
+```bash
+: > broker/config/passwd                      # 새로 시작할 때만
+for i in $(seq -f "%03g" 1 300); do
+  PW=$(openssl rand -base64 24)               # ~144 bit. 사람이 외울 일이 없으니 길게
+  docker run --rm -v "$PWD/broker/config:/mosquitto/config" eclipse-mosquitto:2.0 \
+    mosquitto_passwd -b /mosquitto/config/passwd "agent-$i" "$PW"
+  echo "agent-$i,$PW" >> /dev/shm/agent-creds.csv     # tmpfs. 배포 직후 파기
+done
+chown 1883:1883 broker/config/passwd && chmod 600 broker/config/passwd
+```
+
+- 생성 결과인 `password_file` 은 `username:$7$...` 형태의 해시 목록이다. 평문은 없다.
+- 배포용 CSV는 **디스크에 남기지 않는다**(tmpfs 사용). 배포 후 즉시 삭제.
+- `.gitignore` 에 `broker/config/passwd` 가 있어야 한다.
+
+#### Agent 측 보관
+
+| 방식 | 판단 |
+|---|---|
+| **설정파일 (권한 600, 서비스 계정 소유)** | **기본.** 단순하고 검증이 쉽다 |
+| systemd `LoadCredential=` | 강화 시. 자격증명이 `/run/credentials/` 에만 노출되고 프로세스 트리 밖에서 안 보인다 |
+| 환경변수 | **권장하지 않음.** `/proc/<pid>/environ`, `ps e`, 코어덤프, 자식 프로세스로 전파된다 |
+| jar 내부 하드코딩 / 이미지 레이어 | **금지.** 300대에 같은 값이 박히고 회수가 불가능하다 |
+
+Java 쪽에서는 읽은 뒤 로그·예외 메시지에 절대 싣지 않는다. §16.7의 연결 실패 로그가 `MqttConnectionOptions` 를 통째로 찍으면 자격증명이 로그로 샌다 — `reasonString` 만 찍는 이유가 여기에도 있다.
+
+#### 중앙서버 측
+
+계정은 1개지만 **가장 강력하다.** `topic write cmd/#` 는 300대 전체에 임의 명령을 보낼 수 있는 권한이다. Agent 자격증명 하나가 새면 그 Agent 하나가 위험하지만, `central` 이 새면 전체가 위험하다.
+
+- `.env` 파일(권한 600) 또는 배포 파이프라인 시크릿으로 주입. `.gitignore` 에 `.env` 포함.
+- 컨테이너로 운영한다면 `docker inspect` 로 환경변수가 그대로 보인다는 점에 유의한다.
+
+#### 헬스체크 자격증명 — 숨기지 말고 무력화한다
+
+§7.2 의 healthcheck는 compose 파싱 시점에 값이 컨테이너 설정에 박혀 **`docker inspect` 로 평문 노출**된다. 이를 숨기려 애쓰는 대신, **노출돼도 아무것도 못 하는 계정**을 쓴다.
+
+```
+user health
+topic read  $SYS/broker/uptime      # 이 토픽 하나. 발행 권한 없음
+```
+
+> ⚠️ 여기에 `central` 을 쓰면 안 된다. `central` 은 읽기 권한이 없으므로 ACL이 구독을 거부하고 **헬스체크가 영구 실패해 컨테이너가 unhealthy 로 재시작을 반복**한다.
+
+#### 갱신(rotation)
+
+Mosquitto는 **SIGHUP으로 `password_file` 을 재읽기**하며 기존 연결을 끊지 않는다. 인증은 CONNECT 시점에만 일어나기 때문이다.
+
+```bash
+docker run --rm -v "$PWD/broker/config:/mosquitto/config" eclipse-mosquitto:2.0 \
+  mosquitto_passwd -b /mosquitto/config/passwd agent-001 '<new-pw>'
+docker kill -s HUP mqtt-broker          # 재시작 아님. 300대 연결 유지됨
+```
+
+순서가 중요하다. 브로커를 먼저 갱신하면 해당 Agent는 **접속 중에는 살아 있지만 재접속하는 순간 실패**한다. 따라서:
+
+1. 브로커 갱신 + SIGHUP
+2. 해당 Agent 설정파일 교체
+3. Agent 재기동
+
+2~3 사이에 Agent가 끊기면 복구되지 않으므로, **300대를 한 번에 돌리지 않고 배치로 나눈다.**
+
+만료 정책은 두지 않는다 — 기계 간 인증이고 사람이 외우지 않으므로 주기적 변경의 이득이 없다. **유출 의심·담당자 변경·감사 요구 시에만** 갱신한다.
+
+#### mTLS를 쓰지 않는 이유
+
+§5.3에 강화 옵션으로 `use_identity_as_username true` + 클라이언트 인증서가 있고, ACL 패턴은 그대로 동작한다. 그럼에도 이 환경에서는 채택하지 않는다.
+
+| | `password_file` | mTLS |
+|---|---|---|
+| 배포 대상 | Agent별 비밀번호 | Agent별 keystore(개인키 포함) — **부담은 동일** |
+| **만료** | **없음** | **있음 → 300대 동시 접속 불가 위험** |
+| 시계 의존 | 없음 | X.509 유효기간을 **로컬 시계로 검증** |
+| 폐쇄망 갱신 | 파일 갱신 + SIGHUP | 300장 재발급·재배포 |
+
+배포 부담이 비슷한데 **만료라는 실패 모드만 추가**된다. NTP를 쓰지 않으므로(§3.1) 시계가 밀린 호스트가 유효한 인증서를 거부할 수 있고, 폐쇄망은 만료 알림도 오지 않는다(§15.4). **전송 구간 TLS(서버 인증서)는 유지하되, 클라이언트 인증은 `password_file` 로 간다.**
+
+#### clientId 충돌 주의
+
+Mosquitto는 `clientId == username` 을 강제하지 않는다. agent-002가 설정 실수로 clientId를 `agent-001` 로 쓰면 ACL은 username 기준이라 토픽 접근은 막히지만, **clientId가 겹쳐 서로를 강제 종료(session takeover)** 시킨다. 두 Agent가 무한히 서로를 끊는 플래핑이 되고 §16.7의 로그 폭증으로 이어진다.
+
+Agent 설정에서 **`agentId` 하나로부터 clientId·username을 모두 파생**시키면 구조적으로 막힌다.
 
 ### 5.2 ACL (`config/acl`)
 
@@ -162,10 +265,14 @@ agent-002 : ...
 user central
 topic write cmd/#
 
-# 운영자 계정(선택) — CLI 로 상태 조회만
+# 운영자 계정 — CLI 로 상태 조회만
 user ops
 topic read  evt/#
 topic read  $SYS/#
+
+# 헬스체크 전용 — 토픽 하나만. 자격증명이 노출돼도 할 수 있는 게 없다 (§5.1)
+user health
+topic read  $SYS/broker/uptime
 
 # Agent 공통 패턴 — %u 는 접속 username 으로 치환됨
 pattern read  cmd/%u/req
@@ -269,8 +376,9 @@ services:
       - ./broker/data:/mosquitto/data
       - ./broker/log:/mosquitto/log
     healthcheck:
+      # central 은 읽기 권한이 없다(§5.2). health 전용 계정을 쓴다
       test: ["CMD", "mosquitto_sub", "-h", "localhost", "-p", "1883",
-             "-u", "central", "-P", "${MQTT_CENTRAL_PW}",
+             "-u", "health", "-P", "${MQTT_HEALTH_PW}",
              "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
       interval: 30s
       timeout: 5s
@@ -278,13 +386,16 @@ services:
 ```
 
 - `data/`는 컨테이너 내 uid 1883이 써야 하므로 초기 1회 `chown -R 1883:1883 broker/data broker/log`.
-- `passwd` 생성:
+- `passwd` 생성 (PoC용 최소 예시. **Agent 300개 일괄 생성과 배포·갱신 절차는 §5.1**):
   ```bash
   docker run --rm -v "$PWD/broker/config:/mosquitto/config" eclipse-mosquitto:2.0 \
-    mosquitto_passwd -c -b /mosquitto/config/passwd central '<pw>'
+    mosquitto_passwd -c -b /mosquitto/config/passwd central '<pw>'    # -c 는 최초 1회만
+  docker run --rm -v "$PWD/broker/config:/mosquitto/config" eclipse-mosquitto:2.0 \
+    mosquitto_passwd -b /mosquitto/config/passwd health '<pw>'        # healthcheck 전용
   docker run --rm -v "$PWD/broker/config:/mosquitto/config" eclipse-mosquitto:2.0 \
     mosquitto_passwd -b /mosquitto/config/passwd agent-001 '<pw>'
   ```
+  `.env` 에 `MQTT_CENTRAL_PW`, `MQTT_HEALTH_PW` 를 둔다 (권한 600, `.gitignore` 포함).
 - 로컬 개발 단계에서만 `allow_anonymous true` + ACL 미적용으로 단순화 가능. 단, PoC 통과 직후 인증을 켜는 것을 전제로 한다.
 - **MQTT 5 관련 설정은 없다.** mosquitto 2.0은 3.1.1과 5.0을 같은 리스너에서 동시에 받으며, `Message Expiry Interval` 처리는 기본 동작이다. 클라이언트 쪽 프로토콜 버전만 올리면 된다(§8).
 
