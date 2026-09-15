@@ -1,0 +1,16 @@
+# 자격증명 · 인증서 (§5.3)
+broker/config/passwd
+.env
+*.jks
+*.key
+*.p12
+
+# 브로커 런타임 데이터 (§6)
+broker/data/
+broker/log/
+
+# 빌드 산출물
+build/
+dist/
+__pycache__/
+*.egg-info/
