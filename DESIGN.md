@@ -37,9 +37,28 @@
 ## 2. 식별자 · 토픽 설계
 
 ### 2.1 Agent 식별
-- `agentId`: 전역 유일한 문자열 (예: `agent-001`, 또는 호스트명+UUID). **MQTT clientId로 그대로 사용**한다.
-  - clientId가 유일해야 브로커가 기존 세션을 강제 종료(takeover)하지 않는다.
-  - clientId == agentId == MQTT username 으로 통일하면 ACL 패턴이 단순해진다.
+
+`agentId` 는 Agent 가 스스로 만들지 않는다. 기존 Agent(`mwagent`)의 규칙을 그대로 따른다.
+
+```java
+// Config.java — 환경변수에서 조립한다
+agent_id = ${HOSTNAME} + "_" + ${USER} + "_J"      // 예: myhost01_wasadm_J
+```
+
+- 환경변수 이름은 `agent.properties` 의 `host_name_var` / `user_name_var` 로 지정한다(기본 `HOSTNAME`/`USER`). 기동 스크립트가 `export HOSTNAME=$(hostname)`, `export USER=$(whoami)` 로 채운다.
+- 이 값이 **MQTT clientId · username · 토픽에 모두 그대로** 쓰인다.
+
+> **운영 규칙: 한 계정으로 Agent 를 두 개 띄우지 않는다.**
+> `agentId` 가 (호스트, 계정) 쌍에서 결정되므로, 이 규칙이 지켜지는 한 **agentId 는 구조적으로 유일하다.** 별도의 유일성 보장 장치가 필요 없고, clientId 중복으로 인한 세션 탈취(takeover)도 발생하지 않는다.
+> Agent 를 두 대 운영한다는 것은 곧 **호스트가 다르거나 계정이 다르다**는 뜻이다.
+
+- clientId == agentId == MQTT username 으로 통일되므로 ACL 의 `%u` 치환이 그대로 성립한다(§5.2).
+- 문자 구성은 `[A-Za-z0-9._-]` + `_` 수준이라 MQTT 토픽 제약(`/`, `+`, `#` 불가)에 걸리지 않는다.
+- 브로커 계정도 **같은 이름**으로 만들어야 한다. 이 문서의 예시에 나오는 `agent-001` 은 **가독성을 위한 표기일 뿐**이며, 실제 계정명은 `myhost01_wasadm_J` 형식이다.
+
+```bash
+mosquitto_passwd -b /mosquitto/config/passwd 'myhost01_wasadm_J' '<pw>'
+```
 
 ### 2.2 토픽 규칙
 
@@ -252,11 +271,11 @@ docker kill -s HUP mqtt-broker          # 재시작 아님. 300대 연결 유지
 
 배포 부담이 비슷한데 **만료라는 실패 모드만 추가**된다. NTP를 쓰지 않으므로(§3.1) 시계가 밀린 호스트가 유효한 인증서를 거부할 수 있고, 폐쇄망은 만료 알림도 오지 않는다(§15.4). **전송 구간 TLS(서버 인증서)는 유지하되, 클라이언트 인증은 `password_file` 로 간다.**
 
-#### clientId 충돌 주의
+#### clientId 충돌
 
-Mosquitto는 `clientId == username` 을 강제하지 않는다. agent-002가 설정 실수로 clientId를 `agent-001` 로 쓰면 ACL은 username 기준이라 토픽 접근은 막히지만, **clientId가 겹쳐 서로를 강제 종료(session takeover)** 시킨다. 두 Agent가 무한히 서로를 끊는 플래핑이 되고 §16.7의 로그 폭증으로 이어진다.
+Mosquitto 는 `clientId == username` 을 강제하지 않는다. clientId 가 겹치면 두 클라이언트가 서로를 강제 종료(session takeover)시키며 무한 재접속 루프에 빠진다(§16.7 로그 폭증의 원인 중 하나).
 
-Agent 설정에서 **`agentId` 하나로부터 clientId·username을 모두 파생**시키면 구조적으로 막힌다.
+다만 이 프로젝트에서는 **구조적으로 발생하지 않는다.** `agentId` 가 (호스트, 계정)에서 결정되고 한 계정으로 Agent 를 두 개 띄우지 않는 것이 운영 규칙이기 때문이다(§2.1). Agent 설정에서 clientId·username 을 모두 `agent_id` 하나로부터 파생시키면 그것으로 충분하다.
 
 ### 5.2 ACL (`config/acl`)
 
@@ -283,6 +302,8 @@ pattern write evt/%u/status
 이 ACL로 **agent-001은 agent-002의 명령 토픽을 구독조차 못 한다.** 토픽 기반 라우팅의 보안 이점이 여기서 나온다.
 
 `central` 계정에 읽기 권한이 아예 없다는 점에 주의. 발행 전용 설계가 ACL 레벨에서도 강제되므로, 실수로 구독 코드가 들어가도 브로커가 거부한다.
+
+> 기동 시 `Warning: ACL pattern 'cmd/broadcast/req' does not contain '%c' or '%u'` 경고가 뜬다. `pattern` 행에 치환 문자가 없어서 나는 것이며, **모든 인증 사용자에게 적용되는 규칙으로 정상 동작한다**(실측 확인 — Agent 2대가 broadcast 를 함께 수신). 경고가 싫으면 계정별 `topic read cmd/broadcast/req` 로 풀어 쓸 수 있으나 300줄이 반복되므로 `pattern` 유지를 권한다.
 
 ### 5.3 운영 환경 추가 조치
 - 8883 포트 + TLS(서버 인증서). 사내망이라도 `allow_anonymous false`는 필수.
@@ -559,12 +580,18 @@ public interface ResultReporter {
    ```bash
    # 터미널 A: Agent 역할 (MQTT 5)
    mosquitto_sub -h localhost -V 5 -u agent-001 -P '<pw>' -t 'cmd/agent-001/req' -q 1 -v
-   # 터미널 B: 컨트롤러 역할 — -x 가 Message Expiry Interval(초)
-   mosquitto_pub -h localhost -V 5 -u central -P '<pw>' -t 'cmd/agent-001/req' -q 1 -x 3600 \
-     -m '{"cmdId":"t1","type":"PING","issuedAt":"2026-09-11T00:00:00Z"}'
+   # 터미널 B: 컨트롤러 역할
+   #  ⚠ -x 는 CONNECT 의 session-expiry-interval 이다. 메시지 만료가 아니다.
+   #    메시지 만료는 -D PUBLISH message-expiry-interval <초> 로 준다.
+   mosquitto_pub -h localhost -V 5 -u central -P '<pw>' -t 'cmd/agent-001/req' -q 1 \
+     -D PUBLISH message-expiry-interval 3600 \
+     -m '{"cmdId":"t1","command_class":"ExeText","issuedAt":"2026-09-11T00:00:00Z"}'
    ```
 3. **ACL 격리 확인** — `agent-002` 계정으로 `cmd/agent-001/req` 구독 시 수신 0건이어야 한다.
-   `central` 계정으로 `evt/#` 구독 시에도 **거부**되어야 한다(발행 전용 강제).
+   `central` 계정으로 `evt/#` 구독 시에도 수신 0건이어야 한다(발행 전용 강제).
+
+   > ⚠️ **SUBACK 으로는 판정할 수 없다.** mosquitto는 ACL 위반 구독도 **SUBACK 0(성공)으로 응답**하고, 거부는 **메시지 전달 시점**에 적용한다. `mosquitto_sub -d` 에 `Subscribed (mid: 1): 0` 이 찍히는 것은 정상이며 격리 실패가 아니다.
+   > 따라서 반드시 **실제로 발행해서 수신 건수가 0인지**로 검증한다. 자기 토픽(`cmd/agent-002/req`)이 정상 수신되는지도 함께 봐야 ACL이 과하게 막는 게 아님을 알 수 있다.
 4. **Java Agent 연결** → `evt/agent-001/status` = online retain 확인.
 5. **Python 컨트롤러 연결** → `send()` 가 `cmdId` 를 반환하고 Agent 로그에 수신이 찍히는지 확인.
    (결과 왕복은 REST 측 검증 항목이다 — 범위 밖)
@@ -572,19 +599,23 @@ public interface ResultReporter {
 7. **브로커 재시작 내구성** — `docker compose restart broker` 후에도 큐잉 메시지가 남는지 확인 (`persistence true` 검증).
 8. **중복 확인** — 동일 cmdId 2회 발행 시 1회만 실행.
 9. **★ 1시간 만료 검증** — 핵심 신규 요구사항. 실제로 1시간 기다릴 필요는 없다.
+   **전제**: Agent가 최소 한 번 접속해 세션을 만든 뒤 종료한 상태여야 한다. 세션이 없으면 큐잉 자체가 일어나지 않는다(§4).
+
    ```bash
-   # (a) 짧은 만료로 논리 검증 — Agent 중단 상태에서 발행
-   mosquitto_pub -h localhost -V 5 -u central -P '<pw>' -t 'cmd/agent-001/req' \
-     -q 1 -x 20 -m '{"cmdId":"exp-1","type":"PING", ...}'
-   sleep 25 && <Agent 재기동>        # → 수신 0건이어야 한다
+   PX() { docker exec mqtt-broker mosquitto_pub -h localhost -V 5 -u central -P '<pw>' \
+            -t 'cmd/agent-001/req' -q 1 -D PUBLISH message-expiry-interval "$1" -m "$2"; }
 
-   # (b) 만료 전 재접속 — 잔여 만료값이 차감되어 배달되는지
-   mosquitto_pub ... -x 60 -m '{"cmdId":"exp-2", ...}'
-   sleep 10 && <Agent 재기동>        # → 수신 1건. 정상 실행되어야 한다
+   # (a) 만료 경과 → 배달되지 않아야 한다
+   PX 5    '{"cmdId":"exp-A","command_class":"ShouldExpire"}'
+   # (b) 만료 이내 → 잔여 만료값이 차감되어 배달되어야 한다
+   PX 3600 '{"cmdId":"keep-B","command_class":"ShouldArrive"}'
 
-   # (c) 세션 만료가 메시지 만료보다 짧으면 안 된다는 것 확인
-   #     Agent 의 sessionExpiryInterval 을 10s 로 낮춰 재현 → 큐 자체가 사라짐
+   sleep 9 && <Agent 재기동>     # → keep-B 만 수신. exp-A 는 0건
    ```
+
+   **실측 결과** (mosquitto 2.0.22 / Paho mqttv5 1.2.5 / 2026-09-15): 위 그대로 통과. `exp-A` 미전달, `keep-B` 전달 확인.
+
+   (c) 세션 만료가 메시지 만료보다 짧으면 안 된다는 것도 확인한다 — Agent의 `sessionExpiryInterval` 을 10s 로 낮추면 큐 자체가 사라진다.
    운영값(3600s)은 §12.8의 `$SYS/broker/heap/current` 가 시간 경과에 따라 회수되는지로 간접 확인한다.
 
 ---

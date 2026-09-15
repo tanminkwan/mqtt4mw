@@ -1,0 +1,19 @@
+services:
+  broker:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt-broker
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./broker/config:/mosquitto/config:ro
+      - ./broker/data:/mosquitto/data
+      - ./broker/log:/mosquitto/log
+    healthcheck:
+      # central 은 읽기 권한이 없다(§5.2). health 전용 계정을 쓴다
+      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-p", "1883",
+             "-u", "health", "-P", "${MQTT_HEALTH_PW}",
+             "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
