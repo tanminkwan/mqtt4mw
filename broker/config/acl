@@ -2,9 +2,8 @@
 user central
 topic write cmd/#
 
-# 운영자 계정 — CLI 로 상태 조회만
+# 운영자 계정 — CLI 로 브로커 지표 조회만
 user ops
-topic read  evt/#
 topic read  $SYS/#
 
 # 헬스체크 전용 — 토픽 하나만
@@ -12,6 +11,6 @@ user health
 topic read  $SYS/broker/uptime
 
 # Agent 공통 패턴 — %u 는 접속 username 으로 치환됨
+# subscribe only. write 권한 없음
 pattern read  cmd/%u/req
 pattern read  cmd/broadcast/req
-pattern write evt/%u/status

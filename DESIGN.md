@@ -14,8 +14,8 @@
 │  publish 전용 ─────────┼──▶│ (Docker)   │──▶│  subscribe              │
 │  cmd/agent-001/req     │   │ :1883      │   │  cmd/agent-001/req      │
 │                        │   │            │   │                         │
-│  구독 없음              │   │            │◀──│  publish (LWT / birth)  │
-│                        │   └────────────┘   │  evt/agent-001/status   │
+│  구독 없음              │   │            │   │  발행 없음               │
+│                        │   └────────────┘   │  (subscribe only)       │
 │                        │                    │                         │
 │  REST API              │                    │                         │
 │  POST /api/v1/results  │◀── HTTP (범위 밖) ──│                         │
@@ -26,7 +26,7 @@
 |---|---|---|
 | Broker | `eclipse-mosquitto:2.0` (Docker) | 메시지 라우팅, 인증/ACL, 오프라인 큐잉 |
 | Controller | Python 3.11 + `paho-mqtt>=2.0` | **명령 발행 전용.** 구독하지 않는다 |
-| Agent | Java 17 + `org.eclipse.paho.mqttv5.client:1.2.5` | 자기 토픽 구독, 명령 실행 |
+| Agent | Java 8 + `org.eclipse.paho.mqttv5.client:1.2.5` | **구독 전용.** 자기 토픽 구독, 명령 실행 |
 
 프로토콜은 **MQTT 5.0**을 기준으로 한다. 3.1.1에는 메시지 만료(Message Expiry Interval)가 없어 §3.1의 1시간 자동 소멸을 브로커가 강제할 수 없다.
 
@@ -65,20 +65,20 @@ mosquitto_passwd -b /mosquitto/config/passwd 'myhost01_wasadm_J' '<pw>'
 | 토픽 | 방향 | QoS | Retain | 용도 |
 |---|---|---|---|---|
 | `cmd/{agentId}/req` | 서버 → Agent | 1 | false | **명령 전달 (핵심)** |
-| `evt/{agentId}/status` | Agent → (구독자 없음) | 1 | **true** | `online`/`offline` (LWT). 운영 관측용 |
 | `cmd/broadcast/req` | 서버 → 전체 | 1 | false | 전체 브로드캐스트(옵션) |
 
-`cmd/{agentId}/res` 는 **없다.** 결과는 REST로 나간다(§14).
+**이 두 개가 전부다.** `cmd/{agentId}/res` 도, `evt/{agentId}/status` 도 없다.
+
+- 결과는 REST 로 나간다(§14).
+- Agent 는 **어떤 토픽에도 발행하지 않는다**(subscribe only). 상태 토픽·LWT 도 쓰지 않는다.
 
 설계 원칙:
 - **토픽에 agentId를 박아 라우팅한다.** 페이로드에 목적지를 넣고 전 Agent가 필터링하는 방식은 쓰지 않는다 (불필요한 트래픽 + 정보 노출).
 - **서버는 어떤 토픽도 구독하지 않는다.** 발행만 하므로 Agent가 늘어도 서버 코드·부하는 그대로다.
-- Agent는 `cmd/{자기 agentId}/req` 만 구독. 다른 Agent 토픽은 ACL로 **읽기 자체가 차단**된다.
+- **Agent 는 어떤 토픽에도 발행하지 않는다.** `cmd/{자기 agentId}/req` 와 `cmd/broadcast/req` 만 구독한다. 다른 Agent 토픽은 ACL로 **읽기 자체가 차단**된다.
 - `cmd/{agentId}/req` 는 **retain=false**. retain을 켜면 Agent 재접속 시 과거 명령이 재실행되는 사고가 난다.
-- 상태 토픽은 retain=true로 유지하되 **구독자는 없다.** 비용이 사실상 0(300건 × ~120 B)이면서, 장애 시 운영자가 CLI 한 줄로 생존 여부를 확인할 수 있다:
-  ```bash
-  mosquitto_sub -h localhost -u central -P '<pw>' -t 'evt/+/status' -v -C 300 -W 3
-  ```
+
+> **단방향 설계의 귀결**: MQTT 는 순수한 명령 전달 채널이며, 이 경로로는 **어떤 피드백도 돌아오지 않는다.** Agent 생존 여부·명령 도달 여부를 MQTT 로 알 수 있는 수단이 없다. 관측은 전부 REST 결과 경로(§14)와 브로커 `$SYS` 지표에 의존한다.
 
 ---
 
@@ -129,14 +129,11 @@ Agent 측에는 **만료 검사 코드가 없다.** 배달된 명령은 곧 "만
 - 서버가 MQTT 경로에서 얻는 보장은 **PUBACK(브로커 수신)** 까지다. Agent 도달·실행 여부는 알 수 없다.
 - 미도달 감지 책임은 결과 경로(REST)로 넘어간다. 결과가 안 오면 그쪽에서 타임아웃으로 잡는다.
 
-### 3.3 Status (`evt/{agentId}/status`, retain)
+### 3.3 Status — **사용하지 않음**
 
-```json
-{ "agentId": "agent-001", "state": "online", "version": "1.0.3", "ts": "..." }
-```
-- LWT(Last Will)로 `{"state":"offline"}` 을 retain=true, QoS 1로 등록 → 비정상 종료 시 브로커가 자동 발행.
-- 정상 기동 시 `online` 을 직접 발행(birth message).
-- **구독자는 없다.** 컨트롤러는 이 토픽을 구독하지 않으며, 주기적 하트비트도 두지 않는다(keepAlive 타임아웃으로 브로커가 대신 감지하므로 불필요). 순수하게 **운영자가 CLI로 조회하는 용도**이고, 구독자가 없으므로 상시 트래픽은 0이다.
+Agent 는 상태를 발행하지 않는다(subscribe only). `evt/{agentId}/status`, LWT, birth message 모두 쓰지 않는다.
+
+그 결과 **MQTT 로는 Agent 의 생존 여부를 알 수 없다.** 브로커가 아는 것은 "현재 몇 개의 클라이언트가 붙어 있는지"(`$SYS/broker/clients/connected`)뿐이고, 어느 Agent 인지는 알 수 없다. 생존 판정이 필요하면 REST 결과 경로에서 처리한다(§14).
 
 ---
 
@@ -149,7 +146,7 @@ Agent 측에는 **만료 검사 코드가 없다.** 배달된 명령은 곧 "만
 | `cleanStart` | **false** | true | Agent는 **오프라인 중 도착한 QoS1 명령을 브로커가 큐잉**해 재접속 시 전달해야 함 |
 | `sessionExpiryInterval` | **86400s (24h)** | 0 (연결 종료 시 소멸) | ★ 명령 만료 3600s보다 길어야 큐가 유지된다 |
 | `keepAlive` | 30s | 60s | NAT/LB 타임아웃보다 짧게 |
-| LWT | `evt/{agentId}/status` = offline, QoS1, retain | 없음 | 운영 관측용 |
+| LWT | **없음** | 없음 | Agent 는 발행하지 않는다(§3.3) |
 | 자동 재접속 | ON + 지수 백오프(1s→최대 60s) + jitter | ON | 브로커 재시작 시 썬더링 허드 방지 |
 | 구독 | `connectComplete` 콜백에서 **매번 재구독** | **없음 (발행 전용)** | cleanStart=false라도 재구독이 안전 |
 
@@ -159,7 +156,7 @@ Agent 측에는 **만료 검사 코드가 없다.** 배달된 명령은 곧 "만
 > 1. **배포 순서를 운영 규칙으로 고정** — Agent를 먼저 띄워 세션을 만들고 나서 명령을 보낸다.
 > 2. **미도달 감지는 REST 결과 경로에 위임** — 결과가 오지 않으면 그쪽에서 타임아웃으로 처리한다(§14).
 >
-> 운영자가 세션 존재 여부를 확인해야 할 때는 §2.2의 `evt/+/status` retain 조회를 쓴다.
+> 세션 존재 여부를 MQTT 로 확인할 수단은 없다. Agent 가 상태를 발행하지 않으므로(§3.3) retain 조회도 불가능하다. 브로커 로그(`connection_messages true`, §7.1)에서 CONNECT 기록을 보는 것이 유일한 방법이다.
 
 ---
 
@@ -284,9 +281,8 @@ Mosquitto 는 `clientId == username` 을 강제하지 않는다. clientId 가 �
 user central
 topic write cmd/#
 
-# 운영자 계정 — CLI 로 상태 조회만
+# 운영자 계정 — CLI 로 브로커 지표 조회만
 user ops
-topic read  evt/#
 topic read  $SYS/#
 
 # 헬스체크 전용 — 토픽 하나만. 자격증명이 노출돼도 할 수 있는 게 없다 (§5.1)
@@ -296,12 +292,13 @@ topic read  $SYS/broker/uptime
 # Agent 공통 패턴 — %u 는 접속 username 으로 치환됨
 pattern read  cmd/%u/req
 pattern read  cmd/broadcast/req
-pattern write evt/%u/status
 ```
 
 이 ACL로 **agent-001은 agent-002의 명령 토픽을 구독조차 못 한다.** 토픽 기반 라우팅의 보안 이점이 여기서 나온다.
 
 `central` 계정에 읽기 권한이 아예 없다는 점에 주의. 발행 전용 설계가 ACL 레벨에서도 강제되므로, 실수로 구독 코드가 들어가도 브로커가 거부한다.
+
+**Agent 계정에는 write 권한이 아예 없다.** subscribe only 설계가 ACL 레벨에서도 강제되므로, 실수로 발행 코드가 들어가도 브로커가 거부한다.
 
 > 기동 시 `Warning: ACL pattern 'cmd/broadcast/req' does not contain '%c' or '%u'` 경고가 뜬다. `pattern` 행에 치환 문자가 없어서 나는 것이며, **모든 인증 사용자에게 적용되는 규칙으로 정상 동작한다**(실측 확인 — Agent 2대가 broadcast 를 함께 수신). 경고가 싫으면 계정별 `topic read cmd/broadcast/req` 로 풀어 쓸 수 있으나 300줄이 반복되므로 `pattern` 유지를 권한다.
 
@@ -338,7 +335,7 @@ mqtt/
     ├── build.gradle.kts
     └── src/main/java/com/example/agent/
         ├── AgentMain.java        # 부트스트랩, 시그널 훅
-        ├── MqttConnector.java    # 접속 옵션(v5), LWT, 재구독
+        ├── MqttConnector.java    # 접속 옵션(v5), 재구독
         ├── CommandRouter.java    # type → handler 디스패치, cmdId 중복 차단
         ├── handler/              # RestartServiceHandler, PingHandler ...
         └── ResultReporter.java   # 인터페이스만. 구현은 범위 밖 (§14.4)
@@ -494,8 +491,7 @@ opts.setPassword(cfg.password().getBytes(UTF_8));
 opts.setKeepAliveInterval(30);
 opts.setAutomaticReconnect(true);                     // 백오프 재접속
 opts.setReceiveMaximum(20);                           // v3 의 setMaxInflight 대체
-opts.setWill("evt/" + agentId + "/status",
-        new MqttMessage(offlinePayload(agentId), 1, true, null));   // LWT
+// LWT 없음 — subscribe only (§3.3)
 
 client.setCallback(new MqttCallback() {
     @Override public void connectComplete(boolean reconnect, String uri) {
@@ -503,8 +499,6 @@ client.setCallback(new MqttCallback() {
         try {
             client.subscribe("cmd/" + agentId + "/req", 1);   // 매 접속마다 재구독
             client.subscribe("cmd/broadcast/req", 1);
-            client.publish("evt/" + agentId + "/status",
-                    onlinePayload(agentId), 1, true);         // birth
             if (reconnect && !token.getSessionPresent()) {    // §16.2 — (B) 감지
                 log.warn("session was lost on broker side — commands may have been missed");
             }
@@ -566,7 +560,7 @@ public interface ResultReporter {
 
 ### 8.3 데몬화
 - systemd unit (`Type=simple`, `Restart=always`, `RestartSec=5`)로 Java 프로세스를 관리. JVM 내부에서 재접속을 처리하므로 프로세스 재시작은 크래시 대비용.
-- `Runtime.getRuntime().addShutdownHook` 에서 `status=offline` 발행 → `client.disconnect(5000)` 순서로 graceful shutdown (정상 종료는 LWT가 안 뜨므로 명시 발행 필요).
+- `Runtime.getRuntime().addShutdownHook` 에서 `client.disconnect(5000)` 으로 graceful shutdown. 발행할 상태 메시지가 없으므로(§3.3) 연결만 정리한다.
 
 ---
 
@@ -588,11 +582,11 @@ public interface ResultReporter {
      -m '{"cmdId":"t1","command_class":"ExeText","issuedAt":"2026-09-11T00:00:00Z"}'
    ```
 3. **ACL 격리 확인** — `agent-002` 계정으로 `cmd/agent-001/req` 구독 시 수신 0건이어야 한다.
-   `central` 계정으로 `evt/#` 구독 시에도 수신 0건이어야 한다(발행 전용 강제).
+   Agent 계정으로 **발행**을 시도하면 거부되어야 한다(subscribe only 강제).
 
    > ⚠️ **SUBACK 으로는 판정할 수 없다.** mosquitto는 ACL 위반 구독도 **SUBACK 0(성공)으로 응답**하고, 거부는 **메시지 전달 시점**에 적용한다. `mosquitto_sub -d` 에 `Subscribed (mid: 1): 0` 이 찍히는 것은 정상이며 격리 실패가 아니다.
    > 따라서 반드시 **실제로 발행해서 수신 건수가 0인지**로 검증한다. 자기 토픽(`cmd/agent-002/req`)이 정상 수신되는지도 함께 봐야 ACL이 과하게 막는 게 아님을 알 수 있다.
-4. **Java Agent 연결** → `evt/agent-001/status` = online retain 확인.
+4. **Java Agent 연결** → 브로커 로그에 CONNECT 기록과 `cmd/{agentId}/req` 구독 확인 (`connection_messages true`). 상태 토픽은 쓰지 않으므로 retain 조회로는 확인할 수 없다.
 5. **Python 컨트롤러 연결** → `send()` 가 `cmdId` 를 반환하고 Agent 로그에 수신이 찍히는지 확인.
    (결과 왕복은 REST 측 검증 항목이다 — 범위 밖)
 6. **오프라인 큐잉 확인** — Agent 종료 → 명령 발행 → Agent 재기동 → 명령 수신 확인.
@@ -644,7 +638,7 @@ public interface ResultReporter {
 
 - [ ] `broker/config/{mosquitto.conf,acl}` 작성, `passwd` 생성, `docker compose up`
 - [ ] §9-2, §9-3 CLI 단방향 전달 및 ACL 격리 검증 (`central` 읽기 거부 포함)
-- [ ] Java Agent: **mqttv5 클라이언트로 마이그레이션** + `sessionExpiryInterval 86400` + LWT + `cmd/{agentId}/req` 구독
+- [ ] Java Agent: **mqttv5 클라이언트로 마이그레이션** + `sessionExpiryInterval 86400` + `cmd/{agentId}/req` 구독 (발행 없음)
 - [ ] Python 컨트롤러: **`protocol=mqtt.MQTTv5`** + `send()` 발행 전용 + `MessageExpiryInterval 3600`
 - [ ] cmdId 멱등성 캐시 (만료 검사는 브로커가 하므로 Agent 측 구현 없음)
 - [ ] 오프라인 큐잉 / 브로커 재시작 내구성 검증
@@ -681,7 +675,7 @@ public interface ResultReporter {
 |---|---|---|
 | 동시 TCP 커넥션 | 300 + 1 | 브로커 한도의 ~3% |
 | PINGREQ/RESP | 300 / 30s | **10 회/s** (20 packets/s, ~1 KB/s) |
-| 상태 메시지 | 구독자 없음 · 하트비트 없음 | **0 msg/s** |
+| 상태 메시지 | Agent 가 발행하지 않음 (§3.3) | **0 msg/s** |
 
 유휴 상태에서 Mosquitto CPU는 단일 코어의 **1~3%**, 대역폭은 **수 KB/s**. 사실상 부하가 아니다.
 
@@ -793,7 +787,7 @@ mosquitto_sub -h localhost -u ops -P '<pw>' -v -t '$SYS/broker/#' | \
 | 주소 지정 | 토픽 = 주소. 계층/와일드카드 | 토픽 = 로그 파일 집합. 파티션 = 병렬 단위 |
 | 클라이언트 전제 | 수만 개, 간헐 접속, NAT 뒤, 저사양 | 소수, 상시 접속, 데이터센터 내부 |
 | 메시지 수명 | 전달되면 소멸. **MQTT 5는 미배달분을 지정 시간에 자동 폐기**(§3.1) | **보존 기간 내 재생 가능** |
-| 접속 상태 | LWT로 프로토콜이 알려줌 | 개념 없음 |
+| 접속 상태 | LWT 로 알 수 있음(이 설계는 미사용) | 개념 없음 |
 
 “300대 중 **한 대**를 지목”은 MQTT의 기본 연산이고, Kafka에서는 직접 구현해야 하는 안티패턴이다.
 
@@ -817,7 +811,7 @@ mosquitto_sub -h localhost -u ops -P '<pw>' -v -t '$SYS/broker/#' | \
 
 **(c) 오프셋 되감기 = 과거 명령 재실행.** Agent가 오래된 오프셋으로 재시작하면 밀린 명령을 전부 다시 실행한다. Kafka에는 메시지 만료가 없으므로, MQTT 5가 브로커 차원에서 공짜로 주는 1시간 자동 소멸(§3.1)을 **애플리케이션에서 직접 구현**해야 한다. 그러면 판정이 각 호스트 시계에 의존하게 되어 NTP가 없는 폐쇄망에서는 신뢰하기 어렵다. 로그의 재생 능력이 제어 평면에서는 위험 요소로 작동한다.
 
-**(d) 접속 상태를 알 수 없다.** LWT가 없으므로 §3.3의 online/offline 판정을 하트비트 + 타임아웃 감지로 직접 만들어야 한다.
+**(d) 접속 상태를 알 수 없다.** 다만 이 설계는 MQTT 에서도 LWT 를 쓰지 않으므로(§3.3) 차이가 없다. 양쪽 모두 생존 판정은 REST 결과 경로에 의존한다.
 
 **(e) 네트워크 제약.** Kafka 클라이언트는 `advertised.listeners`의 **모든 브로커에 직접 TCP 연결**을 맺어야 한다. NAT 뒤 300대 엣지 호스트에서는 방화벽 정책이 브로커 수만큼 늘어난다. MQTT는 엔드포인트 하나(필요시 443/WSS)로 끝난다.
 
@@ -1066,7 +1060,7 @@ Agent는 **순수 소비자**라서 다운 중 할 일이 없다. §4·§8.2 설
 |---|---|---|
 | 연결 끊김 감지 | `disconnected()` 콜백. silent drop이면 keepAlive 타임아웃(~45초) | §4 keepAlive 30s |
 | 재접속 | 지수 백오프(1s→60s) **+ jitter** 자동 | §4 `setAutomaticReconnect` |
-| 재접속 성공 | `connectComplete`에서 **매번 재구독** + birth 발행 | §8.2 |
+| 재접속 성공 | `connectComplete`에서 **매번 재구독** (발행 없음) | §8.2 |
 | **실행 중이던 명령** | **그대로 완료된다.** 결과는 REST로 나가므로 브로커와 무관 | §14 |
 
 마지막 항목이 채널 분리 설계의 뜻밖의 이점이다. 결과가 MQTT로 회신되는 구조였다면 브로커 다운 시 **실행은 끝났는데 결과를 보낼 수 없는** 상태가 됐을 것이다. 지금은 브로커가 죽어도 진행 중인 작업과 결과 보고가 멈추지 않는다.
@@ -1145,7 +1139,7 @@ def _replay_outbox(self):
 
 브로커가 살아나면 컨트롤러가 먼저 붙는다(재접속 1개 vs 300개). 이때 (B) 상황이면 **Agent 세션이 아직 없어 발행분이 조용히 폐기된다.**
 
-컨트롤러는 구독을 하지 않으므로 Agent 복귀를 확인할 수단이 없다. 따라서 **시간으로 방어한다.**
+컨트롤러는 구독을 하지 않고 Agent 도 상태를 발행하지 않으므로(§3.3), Agent 복귀를 확인할 수단이 아예 없다. 따라서 **시간으로 방어한다.**
 
 ```python
 def _on_connect(self, client, userdata, flags, rc, props=None):
@@ -1161,7 +1155,7 @@ Agent 백오프 상한이 60초 + jitter(§4)이므로 대부분 이 안에 복�
 | 주체 | 다운 중 | 복구 시 |
 |---|---|---|
 | **브로커** | — | `persistence` 로 세션·큐 복원 (A) |
-| **Agent** | 하던 작업 계속, 결과는 REST로 정상 전송, 백오프 재접속 | 재구독 + birth. `sessionPresent=false` 면 경고 |
+| **Agent** | 하던 작업 계속, 결과는 REST로 정상 전송, 백오프 재접속 | 재구독. `sessionPresent=false` 면 경고 |
 | **중앙서버** | `send()` 즉시 실패 대신 **아웃박스 적재**. 5초 블로킹 금지 | 60초 유예 후 잔여 만료로 재발행 |
 
 **단일 장애점은 브로커 하나다.** Agent 300대·중앙서버는 브로커 없이도 자기 상태를 잃지 않는다. Mosquitto는 클러스터링이 없으므로(§10), 가용성이 요구 수준에 못 미치면 그때가 EMQX 전환 시점이다.
@@ -1366,7 +1360,7 @@ stdout → systemd journald 구성이라면 `journald.conf` 의 `SystemMaxUse=` 
 - [ ] 아웃박스 `PENDING` 건수·최고 적체 시간을 메트릭으로 노출하는가
 - [ ] `EXPIRED_BEFORE_PUBLISH` 발생 시 알림이 가는가 (명령이 실행되지 않았다는 뜻)
 - [ ] 브로커 재시작 후 **명령 도달**까지 확인하는 런북이 있는가 (컨테이너 기동 확인만으로는 부족)
-- [ ] (B) 복구 런북 — ops 계정으로 `$SYS/broker/clients/connected` 가 300에 도달했는지 확인 후 발행 재개
+- [ ] (B) 복구 런북 — ops 계정으로 `$SYS/broker/clients/connected` 가 300에 도달했는지 확인 후 발행 재개 (개별 Agent 식별은 불가 — 개수만 본다)
 - [ ] **재접속 실패 로그가 시간 기준으로 억제되는가** (§16.7 대책 1) — 횟수 기준은 플래핑에서 무력하다
 - [ ] `connectComplete` 에서 복구 로그를 찍지 않는가 — 60초 안정 후에만 보고
 - [ ] **MQTT 연결 로그가 별도 appender로 분리돼 있는가** (§16.7 대책 2) — `additivity="false"` 확인
