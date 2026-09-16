@@ -102,7 +102,12 @@ id -g
 - bind mount 는 uid 를 번역하지 않고 숫자만 비교하므로, 컨테이너 안 프로세스도 같은 uid 라 그대로 읽는다
 - `chmod 600` 이 그대로 유효해 mosquitto 의 권한 경고가 뜨지 않는다 (실측 확인 — 기동 로그에 경고 없음)
 
-> `docker` 사용자가 `docker` 그룹에 속해 있어야 한다. `docker ps` 가 `permission denied` 없이 실행되면 된다.
+전제 조건은 두 가지뿐이다.
+
+- `docker` 사용자가 **`docker` 그룹**에 속할 것 — `docker ps` 가 `permission denied` 없이 실행되면 된다
+- `/sw/docker` 에 **쓰기 권한**이 있을 것 — `test -w /sw/docker` (§2.1)
+
+둘 다 충족되면 **설치부터 운영까지 root 가 개입하는 지점이 없다.**
 
 ---
 
@@ -213,6 +218,12 @@ docker run --rm --user "$(id -u):$(id -g)" -v /sw/docker/mqtt/config:/w <이미�
 
 ### 2.1 디렉터리 생성
 
+`docker` 사용자가 `/sw/docker` 에 쓰기 권한을 가진다는 전제다. 먼저 확인한다:
+
+```bash
+test -w /sw/docker && echo "쓰기 가능" || echo "권한 없음 — 인프라 담당 요청 필요"
+```
+
 ```bash
 mkdir -p /sw/docker/mqtt/{config,data,log}
 ```
@@ -236,8 +247,6 @@ drwx------ 2 docker docker 4096 ... /sw/docker/mqtt/config
 drwx------ 2 docker docker 4096 ... /sw/docker/mqtt/data
 drwx------ 2 docker docker 4096 ... /sw/docker/mqtt/log
 ```
-
-`/sw/docker` 에 쓰기 권한이 없어 `mkdir` 이 실패하면 **인프라 담당에게 `docker` 사용자 소유의 `/sw/docker/mqtt` 생성을 요청**한다. 이 가이드에서 root 가 필요한 유일한 지점이다.
 
 #### 왜 이 단계를 건너뛰면 안 되는가
 
