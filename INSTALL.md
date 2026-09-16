@@ -90,7 +90,7 @@ uid/gid **1883** 은 컨테이너 안 `mosquitto` 계정 번호다. **호스트�
 
 ### 0.4 실행 위치 표기 — 호스트 작업과 컨테이너 작업 구분
 
-**결론부터: 이 가이드의 작업은 거의 전부 리눅스 호스트에서 한다.** 컨테이너 셸에 들어가는 작업은 §9 의 점검 명령 하나뿐이다.
+**결론부터: 이 가이드의 작업은 거의 전부 리눅스 호스트에서 한다.** 돌고 있는 컨테이너 안에서 실행하는 명령은 접속 수 조회(§8.5, §9) 하나뿐이다.
 
 각 절 머리에 아래 세 가지 중 하나를 표시한다.
 
@@ -139,7 +139,7 @@ docker run --rm --user 1883:1883 -v /srv/mqtt/config:/w <이미지> \
 | §6 배포 | **[호스트]** | `/srv/mqtt` |
 | §7 설치 검증 | **[운영자 단말]·[Agent 호스트]** — 브로커 **밖**에서 | 임의 |
 | §8 운영 절차 | **[호스트]** + **[호스트 → 일회용 컨테이너]** | `/srv/mqtt` |
-| §9 트러블슈팅 | **[호스트]** (점검 명령 1개만 **[컨테이너 내부]**) | `/srv/mqtt` |
+| §9 트러블슈팅 | **[호스트]** (접속 수 조회만 **[컨테이너 내부]**) | `/srv/mqtt` |
 
 ---
 
@@ -799,147 +799,425 @@ mosquitto version 2.0.22 running
 ## 7. 설치 검증
 
 > **실행 위치: 브로커 호스트가 아니라 [운영자 단말] 또는 [Agent 호스트].**
-> 방화벽·네트워크 경로까지 함께 검증해야 하므로, 브로커 안에서 `localhost` 로 테스트하면 의미가 없다.
+> 방화벽·네트워크 경로까지 함께 검증해야 한다. 브로커 안에서 `localhost` 로 테스트하면 경로 검증이 빠져 의미가 없다.
 
 **순서대로** 진행한다. 앞 단계가 통과해야 다음 단계의 결과를 신뢰할 수 있다.
 
-### 7.1 경로
+### 7.0 검증 도구 준비
+
+`mosquitto_sub`/`mosquitto_pub` 가 필요하다. 둘 중 하나를 쓴다.
+
+**방법 A — 패키지 설치** (운영자 단말)
+```bash
+sudo yum install -y mosquitto        # RHEL/CentOS
+sudo apt install -y mosquitto-clients # Debian/Ubuntu
+```
+
+**방법 B — 이미지에서 빌려 쓰기** (폐쇄망에서 패키지 설치가 어려울 때)
+```bash
+mqtt() { docker run --rm --network host <이미지> "$@"; }
+mqtt mosquitto_sub --help | head -1
+```
+
+이하 명령은 `mosquitto_sub ...` 로 적는다. 방법 B 를 쓴다면 앞에 `mqtt ` 를 붙인다.
+
+#### 검증 전 변수 설정
 
 ```bash
-# Agent 호스트에서 — 애플리케이션 없이 경로만 먼저
-nc -zv <broker-ip> 1883
+export BROKER=10.x.y.10          # 브로커 IP 또는 FQDN
+export A1=myhost01_wasadm_J      # 검증용 Agent 1
+export A2=myhost02_wasadm_J      # 검증용 Agent 2
 ```
+
+`central`·`ops`·Agent 비밀번호는 §5.8 에서 배포한 값을 쓴다.
+
+---
+
+### 7.1 네트워크 경로
+
+애플리케이션 없이 TCP 도달만 먼저 본다.
+
+```bash
+nc -zv "$BROKER" 1883
+```
+
+기대 출력:
+```
+Connection to 10.x.y.10 1883 port [tcp/*] succeeded!
+```
+
+| 실패 | 원인 | 조치 |
+|---|---|---|
+| `Connection refused` | 브로커 미기동 또는 포트 미개방 | §6.3 `docker compose ps` 확인 |
+| `Connection timed out` | 방화벽 미개방 | §1.1 신청 상태 확인 |
+| `Name or service not known` | DNS 미해석 | IP 로 시도, `/etc/hosts` 고정 검토 |
+
+**여기서 막히면 이후가 전부 막힌다.** 반드시 먼저 해결한다.
 
 ### 7.2 인증
 
 ```bash
-# 정상 계정
-mosquitto_sub -h <broker-ip> -p 1883 -u ops -P '<pw>' \
+# ① 정상 계정
+mosquitto_sub -h "$BROKER" -p 1883 -u ops -P '<ops 비밀번호>' \
   -t '$SYS/broker/version' -C 1
-
-# 익명 거부 확인
-mosquitto_sub -h <broker-ip> -p 1883 -t '$SYS/#' -C 1
-# → Connection Refused: not authorised.
 ```
-
-### 7.3 토픽 격리
+기대 출력:
+```
+mosquitto version 2.0.22
+```
 
 ```bash
-# agentA 계정으로 agentB 토픽 구독 시도
-mosquitto_sub -h <broker-ip> -p 1883 \
-  -u 'hostA_wasadm_J' -P '<pw>' -t 'cmd/hostB_wasadm_J/req' -v
+# ② 익명 접속 — 거부되어야 한다
+mosquitto_sub -h "$BROKER" -p 1883 -t '$SYS/#' -C 1
+```
+기대 출력:
+```
+Connection error: Connection Refused: not authorised.
 ```
 
-> ⚠️ **SUBACK으로 판정하지 말 것.** mosquitto는 ACL 위반 구독도 SUBACK 0으로 응답하고 **전달 시점에 차단한다.** 반드시 `central`로 해당 토픽에 실제 발행한 뒤 **수신되지 않음**을 확인한다.
+```bash
+# ③ 틀린 비밀번호 — 거부되어야 한다
+mosquitto_sub -h "$BROKER" -p 1883 -u ops -P 'wrong' -t '$SYS/#' -C 1
+```
+기대 출력:
+```
+Connection error: Connection Refused: not authorised.
+```
+
+②가 성공하면 `allow_anonymous false` 가 적용되지 않은 것이다. §4.1 을 확인하고 §6 을 다시 기동한다.
+
+### 7.3 토픽 격리 — 가장 중요한 검증
+
+`$A2` 계정으로 `$A1` 의 명령 토픽을 구독해도 **명령이 오지 않아야** 한다.
+
+**터미널 1** — 남의 토픽 구독 시도:
+```bash
+mosquitto_sub -h "$BROKER" -p 1883 -u "$A2" -P '<A2 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -W 10
+```
+
+**터미널 2** — 자기 토픽 구독:
+```bash
+mosquitto_sub -h "$BROKER" -p 1883 -u "$A1" -P '<A1 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -W 10
+```
+
+**터미널 3** — `central` 로 실제 발행:
+```bash
+mosquitto_pub -h "$BROKER" -p 1883 -V 5 -u central -P '<central 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -m '{"cmdId":"iso-test"}'
+```
+
+기대 결과:
+
+| 터미널 | 기대 출력 | 의미 |
+|---|---|---|
+| 1 (남의 토픽) | `Timed out` — **수신 0건** | 격리 성공 |
+| 2 (자기 토픽) | `{"cmdId":"iso-test"}` | 정상 수신 |
+
+> ⚠️ **SUBACK 으로 판정하지 말 것.** mosquitto 는 ACL 위반 구독도 **SUBACK 0(성공)으로 응답**하고 거부는 **메시지 전달 시점**에 적용한다. `-d` 옵션에 `Subscribed (mid: 1): 1` 이 찍히는 것은 정상이며 격리 실패가 아니다.
+> 터미널 2 를 함께 보는 이유는, ACL 이 **과하게 막고 있지 않은지**도 동시에 확인하기 위해서다. 둘 다 0건이면 격리가 아니라 설정 오류다.
+
+터미널 1 에 메시지가 오면 **계정명이 agentId 와 다르거나** ACL 의 `%u` 패턴이 잘못된 것이다. §5.1 과 §4.2 를 확인한다.
 
 ### 7.4 발행 전용 / 구독 전용 강제
 
 ```bash
-# central 은 읽기 권한이 없어야 한다 → 0건
-mosquitto_sub -h <broker-ip> -p 1883 -u central -P '<pw>' -t 'evt/#' -W 5
-
-# Agent 계정은 발행 권한이 없어야 한다
-mosquitto_pub -h <broker-ip> -p 1883 -u 'hostA_wasadm_J' -P '<pw>' \
-  -t 'cmd/hostA_wasadm_J/req' -m 'x'
+# ① central 은 읽기 권한이 없어야 한다
+mosquitto_sub -h "$BROKER" -p 1883 -u central -P '<central 비밀번호>' -t 'evt/#' -W 5
 ```
-
-### 7.5 메시지 만료
+기대 출력 — **`Timed out`, 수신 0건**:
+```
+Timed out
+```
 
 ```bash
-mosquitto_pub -h <broker-ip> -p 1883 -u central -P '<pw>' \
-  -t 'cmd/hostA_wasadm_J/req' -q 1 \
-  -D PUBLISH message-expiry-interval 10 -m '{"cmdId":"exp-A"}'
+# ② Agent 는 발행 권한이 없어야 한다 — -V 5 가 필수다
+mosquitto_pub -h "$BROKER" -p 1883 -V 5 -u "$A1" -P '<A1 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -m 'x' -d | grep PUBACK
+```
+기대 출력:
+```
+Client ... received PUBACK (Mid: 1, RC:135)
 ```
 
-> `mosquitto_pub`의 `-x`는 **session-expiry-interval이지 메시지 만료가 아니다.**
-> `-D PUBLISH message-expiry-interval <초>` 가 맞다. 실측으로 확인된 함정이다.
+`RC:135` 가 **Not authorized** 다. 거부되었다는 뜻이며 이것이 정상이다.
 
-Agent 세션을 미리 만들어 둔 상태에서 발행하고, 11초 후 접속시켜 `exp-A`가 **오지 않는지** 확인한다. 만료 이내(예: 3600초)로 보낸 메시지는 전달되어야 한다.
+> ⚠️ **`-V 5` 를 빼면 검증이 무효가 된다.** MQTT 3.1.1 에는 PUBACK 에 사유 코드가 없어, 거부된 발행도 다음과 같이 **성공처럼 보인다**:
+> ```
+> Client null received PUBACK (Mid: 1, RC:0)     ← 종료코드도 0
+> ```
+> 메시지는 실제로 버려지지만 발행자는 알 수 없다. 실측으로 확인된 함정이다.
 
-### 7.6 오프라인 큐잉
+### 7.5 오프라인 큐잉
 
-Agent를 내린 상태에서 명령을 발행하고, 재접속 시 전달되는지 확인한다. 이어서 브로커를 재시작한 뒤에도 큐가 살아 있는지 본다 (`persistence true`).
+Agent 가 꺼져 있을 때 발행한 명령이 재접속 시 전달되는지 본다.
 
 ```bash
-docker compose restart
+# ① 세션 생성 — 접속했다가 끊는다
+mosquitto_sub -h "$BROKER" -p 1883 -V 5 -u "$A1" -P '<A1 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -c -i "$A1" -x 300 -W 2
+
+# ② 오프라인 상태에서 발행
+mosquitto_pub -h "$BROKER" -p 1883 -V 5 -u central -P '<central 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -m '{"cmdId":"queued-1"}'
+
+# ③ 재접속
+mosquitto_sub -h "$BROKER" -p 1883 -V 5 -u "$A1" -P '<A1 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -c -i "$A1" -x 300 -W 5
 ```
 
-### 7.7 장시간 유휴 — 폐쇄망 전용 필수 항목
+기대 출력 (③):
+```
+{"cmdId":"queued-1"}
+```
+
+옵션의 의미 — **하나라도 빠지면 큐잉이 일어나지 않는다**:
+
+| 옵션 | 의미 |
+|---|---|
+| `-q 1` | **구독 QoS.** QoS 0 구독은 오프라인 큐잉 대상이 아니다 |
+| `-c` | clean session 해제. 끊어도 세션을 유지한다 |
+| `-i "$A1"` | clientId 고정. 같은 세션으로 돌아오기 위해 필요하다 |
+| `-x 300` | 세션 만료 300초. MQTT 5 에서 지정하지 않으면 기본 0(즉시 소멸)이다 |
+
+> ⚠️ **`-q 1` 누락이 가장 흔한 실수다.** 발행을 QoS 1 로 해도 **구독이 QoS 0 이면 유효 QoS 는 0** 이라 큐에 쌓이지 않는다. ③에 아무것도 오지 않으면서 오류도 없다면 이것을 먼저 의심한다.
+
+### 7.6 메시지 만료
+
+명령이 1시간 뒤 자동 소멸하는지 확인한다. 실제로 1시간 기다릴 필요는 없다.
 
 ```bash
-# Agent 1대를 붙여놓고 1시간 이상 방치한 뒤 명령 발행
+# ① 세션 생성
+mosquitto_sub -h "$BROKER" -p 1883 -V 5 -u "$A1" -P '<A1 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -c -i "$A1" -x 300 -W 2
+
+# ② 오프라인 상태에서 두 건 발행 — 만료 5초 / 300초
+mosquitto_pub -h "$BROKER" -p 1883 -V 5 -u central -P '<central 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -D PUBLISH message-expiry-interval 5   -m '{"cmdId":"exp-A"}'
+mosquitto_pub -h "$BROKER" -p 1883 -V 5 -u central -P '<central 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -D PUBLISH message-expiry-interval 300 -m '{"cmdId":"keep-B"}'
+
+# ③ 8초 경과 후 재접속
+sleep 8
+mosquitto_sub -h "$BROKER" -p 1883 -V 5 -u "$A1" -P '<A1 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -c -i "$A1" -x 300 -W 5
 ```
 
-**건너뛰면 운영 중에 발견하게 된다.** 방화벽·NAT가 유휴 세션을 RST 없이 조용히 버리면, 브로커는 정상 publish + PUBACK을 받지만 Agent에는 도달하지 않는다.
+기대 출력 (③) — **`keep-B` 만 오고 `exp-A` 는 오지 않는다**:
+```
+{"cmdId":"keep-B"}
+Timed out
+```
 
-### 7.8 체크리스트
+> `mosquitto_pub` 의 `-x` 는 **session-expiry-interval 이지 메시지 만료가 아니다.**
+> 메시지 만료는 `-D PUBLISH message-expiry-interval <초>` 다. 실측으로 확인된 함정이다.
 
-- [ ] `nc -zv` 소통
-- [ ] 익명 접속 거부
-- [ ] 토픽 격리 — **발행 실측으로** 확인
-- [ ] `central` 구독 0건 / Agent 발행 거부
-- [ ] 메시지 만료 — 경과분 폐기, 이내분 전달
-- [ ] 브로커 재시작 후 오프라인 큐 복원
-- [ ] **1시간 유휴 후 명령 도달**
-- [ ] `docker compose ps` → healthy
+**세션 만료가 메시지 만료보다 짧으면 안 된다.** `-x` 를 10 으로 낮추면 세션 자체가 먼저 사라져 큐가 통째로 없어진다. 운영값은 세션 24시간 / 메시지 1시간이다.
+
+### 7.7 브로커 재시작 내구성
+
+**[호스트]** 에서:
+```bash
+cd /srv/mqtt && docker compose restart
+```
+
+재시작 전에 §7.5 ②까지 수행해 큐에 메시지를 남겨두고, 재시작 후 ③으로 수신되는지 본다. `persistence true` 가 동작하면 큐가 살아남는다.
+
+확인:
+```bash
+sudo ls -l /srv/mqtt/data/mosquitto.db
+```
+파일이 존재하고 크기가 0 이 아니어야 한다.
+
+### 7.8 장시간 유휴 — 폐쇄망 필수 항목
+
+**이 항목을 건너뛰면 운영 중에 발견하게 된다.**
+
+```bash
+# Agent 1대를 접속시킨 채 1시간 이상 방치한 뒤, 명령을 발행해 도달하는지 확인
+mosquitto_sub -h "$BROKER" -p 1883 -V 5 -u "$A1" -P '<A1 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -c -i "$A1" -x 86400 -W 4000
+```
+
+1시간 이상 지난 뒤 다른 터미널에서:
+```bash
+mosquitto_pub -h "$BROKER" -p 1883 -V 5 -u central -P '<central 비밀번호>' \
+  -t "cmd/$A1/req" -q 1 -m '{"cmdId":"idle-test"}'
+```
+
+구독 쪽에 `{"cmdId":"idle-test"}` 가 떠야 한다. 오지 않으면 방화벽·NAT 가 유휴 세션을 RST 없이 버린 것이다(half-open). 브로커는 정상 publish 하고 PUBACK 도 받지만 Agent 에는 도달하지 않는다. §1.1 의 idle timeout 값을 상향 요청한다.
+
+### 7.9 체크리스트
+
+- [ ] 7.1 `nc -zv` → `succeeded!`
+- [ ] 7.2 익명·오류 비밀번호 → `not authorised`
+- [ ] 7.3 토픽 격리 — 남의 토픽 0건 / 자기 토픽 수신
+- [ ] 7.4 `central` 구독 0건 / Agent 발행 `RC:135`
+- [ ] 7.5 오프라인 큐잉 — 재접속 시 수신
+- [ ] 7.6 메시지 만료 — 경과분 폐기, 이내분 전달
+- [ ] 7.7 브로커 재시작 후에도 큐 유지
+- [ ] 7.8 **1시간 유휴 후 명령 도달**
+- [ ] `docker compose ps` → `Up (healthy)`
 
 ---
 
 ## 8. 운영 절차
 
-> **[호스트] 작업 디렉터리: `/srv/mqtt`** — 일부는 **[호스트 → 일회용 컨테이너]**
+> **[호스트] 작업 디렉터리: `/srv/mqtt`** — 계정 조작은 **[호스트 → 일회용 컨테이너]**(§0.4)
 
 ### 8.1 비밀번호 갱신 — 무중단
 
-mosquitto는 SIGHUP으로 `password_file`을 재읽기하며 **기존 연결을 끊지 않는다.** 인증은 CONNECT 시점에만 일어나기 때문이다.
+mosquitto 는 **SIGHUP 으로 `password_file` 을 다시 읽으며 기존 연결을 끊지 않는다.** 인증은 CONNECT 시점에만 일어나기 때문이다. 300대가 붙어 있는 채로 갱신할 수 있다.
 
-```bash
-# 설정 디렉터리가 :ro 이므로 호스트에서 수정한다
-sudo docker run --rm --user 1883:1883 -v /srv/mqtt/config:/w \
-  registry.corp.local/mqtt/eclipse-mosquitto:2.0.22 \
-  mosquitto_passwd -b /w/passwd '<agentId>' '<new-pw>'
-
-docker kill -s HUP mqtt-broker          # 재시작 아님. 300대 연결 유지
-```
-
-**순서가 중요하다.** 브로커를 먼저 갱신하면 해당 Agent는 접속 중에는 살아 있지만 **재접속하는 순간 실패**한다.
-
-1. 브로커 갱신 + SIGHUP
-2. Agent 설정파일 갱신
-3. Agent 재기동
-
-### 8.2 백업
-
-```bash
-docker compose stop
-sudo tar czf mqtt-backup-$(date +%F).tgz -C /srv/mqtt config data
-docker compose start
-```
-
-`data/mosquitto.db`는 세션과 오프라인 큐다. 유실되면 복구 후 발행분이 **세션이 없어 조용히 폐기된다.**
-
-### 8.3 브로커 재시작 시 주의
-
-패치·설정 변경으로 재시작하면 **300대가 동시에 재접속한다.** Agent에 지수 백오프 + `random(0, 5s)` jitter가 들어 있는지 확인한다. Paho의 `setAutomaticReconnect`는 백오프는 하지만 **jitter 가 없어 위상이 겹친다.**
-
-평문이라 TLS 핸드셰이크 부하가 없어 **재접속 폭주 자체는 수백 ms 내 완료된다.** 다만 재접속이 실패 반복으로 이어지면 로그가 폭증하므로 §2.3 로테이션을 확인한다.
-
-### 8.4 계정 추가 (Agent 증설)
+**① 브로커 쪽 갱신**
 
 ```bash
 sudo docker run --rm --user 1883:1883 -v /srv/mqtt/config:/w \
   registry.corp.local/mqtt/eclipse-mosquitto:2.0.22 \
-  mosquitto_passwd -b /w/passwd '<새 agentId>' '<pw>'
+  mosquitto_passwd -b /w/passwd '<agentId>' '<새 비밀번호>'
+```
+
+출력이 없으면 성공이다. `-v` 로 마운트한 호스트의 `/srv/mqtt/config/passwd` 가 바뀐다.
+
+**② 브로커에 재읽기 지시**
+
+```bash
 docker kill -s HUP mqtt-broker
 ```
 
-ACL은 `pattern` 기반이라 **수정할 필요가 없다.** 계정만 추가하면 `cmd/%u/req`가 자동으로 적용된다.
+**재시작이 아니다.** 컨테이너는 그대로이고 접속 중인 Agent 도 끊기지 않는다. 확인:
+
+```bash
+docker compose ps        # STATUS 가 Up (재시작되면 uptime 이 초기화된다)
+```
+
+**③ 검증**
+
+```bash
+# 새 비밀번호로 접속 — 성공해야 한다
+mosquitto_sub -h <BROKER> -p 1883 -u '<agentId>' -P '<새 비밀번호>' \
+  -t 'cmd/<agentId>/req' -C 1 -W 3
+
+# 옛 비밀번호로 접속 — 거부되어야 한다
+mosquitto_sub -h <BROKER> -p 1883 -u '<agentId>' -P '<옛 비밀번호>' \
+  -t 'cmd/<agentId>/req' -C 1 -W 3
+```
+
+기대 출력:
+```
+(새 비밀번호) Timed out              ← 접속 성공. 명령이 없어 타임아웃
+(옛 비밀번호) Connection error: Connection Refused: not authorised.
+```
+
+**④ Agent 쪽 갱신**
+
+```bash
+ssh <호스트> "sed -i 's|^mqtt.password=.*|mqtt.password=<새 비밀번호>|' /opt/agent/agent.properties"
+ssh <호스트> "systemctl restart agent"
+```
+
+#### 순서를 지켜야 하는 이유
+
+**브로커를 먼저 갱신한다.** 그래야 해당 Agent 는 접속 중에는 살아 있고, 재접속하는 순간부터 새 값을 요구받는다. Agent 를 먼저 바꾸면 그 사이 재접속이 발생했을 때 즉시 실패한다.
+
+1. 브로커 갱신 + SIGHUP (①②)
+2. 검증 (③)
+3. Agent 설정 교체 + 재기동 (④)
+
+2~3 사이에 Agent 가 끊기면 복구되지 않으므로 **300대를 한 번에 돌리지 않고 배치로 나눈다.**
+
+> 만료 정책은 두지 않는다. 기계 간 인증이고 사람이 외우지 않으므로 주기적 변경의 이득이 없다. **유출 의심·담당자 변경·감사 요구 시에만** 갱신한다.
+
+### 8.2 계정 추가 (Agent 증설)
+
+```bash
+sudo docker run --rm --user 1883:1883 -v /srv/mqtt/config:/w \
+  registry.corp.local/mqtt/eclipse-mosquitto:2.0.22 \
+  mosquitto_passwd -b /w/passwd '<새 agentId>' '<비밀번호>'
+docker kill -s HUP mqtt-broker
+```
+
+확인:
+```bash
+sudo grep -c '' /srv/mqtt/config/passwd        # 계정 수가 1 늘어야 한다
+sudo cut -d: -f1 /srv/mqtt/config/passwd | tail -1
+```
+
+**ACL 은 수정할 필요가 없다.** `pattern read cmd/%u/req` 가 계정명으로 자동 치환되므로, 계정만 추가하면 해당 Agent 의 토픽 권한이 바로 생긴다.
+
+### 8.3 계정 삭제 (Agent 폐기)
+
+```bash
+sudo docker run --rm --user 1883:1883 -v /srv/mqtt/config:/w \
+  registry.corp.local/mqtt/eclipse-mosquitto:2.0.22 \
+  mosquitto_passwd -D /w/passwd '<agentId>'
+docker kill -s HUP mqtt-broker
+```
+
+> SIGHUP 은 **기존 연결을 끊지 않는다.** 삭제된 계정으로 접속 중인 Agent 는 **끊길 때까지 살아 있다.** 즉시 차단해야 한다면 해당 Agent 를 먼저 정지시킨다.
+
+### 8.4 백업
+
+```bash
+cd /srv/mqtt
+docker compose stop
+sudo tar czf /var/backups/mqtt-$(date +%F).tgz -C /srv/mqtt config data
+docker compose start
+docker compose ps        # Up (healthy) 확인
+```
+
+`data/mosquitto.db` 는 **세션과 오프라인 큐**다. 유실되면 복구 후 발행된 명령이 **세션이 없어 조용히 폐기된다.** 오류도 로그도 남지 않으므로 백업 대상에서 빼지 않는다.
+
+> `docker compose stop` 중에는 300대가 재접속을 시도한다. 백업은 짧게 끝내고, 업무 시간 외에 수행한다.
+
+#### 복원
+
+```bash
+cd /srv/mqtt
+docker compose down
+sudo tar xzf /var/backups/mqtt-<날짜>.tgz -C /srv/mqtt
+sudo chown -R 1883:1883 /srv/mqtt/config /srv/mqtt/data
+docker compose up -d
+```
+
+`chown` 을 빼먹으면 §2.2 의 권한 경고가 재발한다.
+
+### 8.5 브로커 재시작 시 주의
+
+패치·설정 변경으로 재시작하면 **300대가 동시에 재접속한다.**
+
+```bash
+cd /srv/mqtt && docker compose restart
+```
+
+- Agent 에 **지수 백오프 + `random(0, 5s)` jitter** 가 들어 있는지 확인한다. Paho 의 `setAutomaticReconnect` 는 백오프는 하지만 **jitter 가 없어 위상이 겹친다.**
+- 평문이라 TLS 핸드셰이크 부하가 없어 재접속 폭주 자체는 수백 ms 내 완료된다. 다만 재접속이 실패 반복으로 이어지면 로그가 폭증하므로 §2.3 로테이션을 확인한다.
+
+재시작 후 접속 수 확인:
+```bash
+docker exec mqtt-broker mosquitto_sub -h localhost -p 1883 \
+  -u ops -P '<ops 비밀번호>' -t '$SYS/broker/clients/connected' -C 1
+```
+
+### 8.6 일상 점검
+
+```bash
+cd /srv/mqtt
+docker compose ps                              # Up (healthy)
+docker compose logs --since 24h | grep -ci error
+df -h /var/lib/docker                          # 로그 누적 확인
+sudo ls -lh /srv/mqtt/data/mosquitto.db        # 큐 크기 추이
+```
+
+`mosquitto.db` 가 계속 커지면 오프라인 Agent 가 쌓이고 있다는 뜻이다. 접속 수(§8.5)와 대조한다.
 
 ---
 
+
 ## 9. 트러블슈팅
 
-> **[호스트]** — 마지막 점검 명령 하나만 **[컨테이너 내부]**
+> **[호스트]** — 접속 수 조회만 **[컨테이너 내부]**
 
 | 증상 | 원인 | 조치 |
 |---|---|---|
@@ -947,19 +1225,22 @@ ACL은 `pattern` 기반이라 **수정할 필요가 없다.** 계정만 추가�
 | `Config loaded` 로그가 없음 | 마운트 경로 불일치 | §6.1 볼륨 경로 확인 |
 | 컨테이너 `unhealthy` 반복 | 헬스체크에 `central` 사용 | `central` 은 읽기 권한이 없어 ACL 이 거부한다. `health` 계정을 쓸 것 (§4.2) |
 | 특정 Agent만 인증 실패 | 계정명 ≠ agentId | §5.1. `${HOSTNAME}_${USER}_J` 와 정확히 일치해야 함 |
-| 명령이 간헐적으로 유실 | 방화벽 idle timeout | §7.7. half-open. idle timeout 상향 |
+| 명령이 간헐적으로 유실 | 방화벽 idle timeout | §7.8. half-open. idle timeout 상향 |
 | 접속은 되는데 명령이 안 옴 | ACL 위반 (SUBACK은 정상) | §7.3. 전달 시점 차단이라 구독은 성공해 보인다 |
-| 재시작 후 명령이 조용히 사라짐 | `data/` 유실 → 세션 없음 | §8.2 복원 |
+| 재시작 후 명령이 조용히 사라짐 | `data/` 유실 → 세션 없음 | §8.4 복원 |
 | 두 Agent 가 무한 재접속 | clientId 충돌 (session takeover) | 한 호스트·한 계정으로 Agent 를 두 개 띄운 경우. agentId 가 겹친다 (§5.1) |
 | 디스크 고갈 | 브로커 장기 다운 → 로그 폭증 | §2.3 로테이션 확인 |
-| 미상 프로토콜로 차단 | IPS/DPI 오탐 | §1.1. 평문이라 DPI가 페이로드를 본다. 예외 등록 요청 |
+| 미상 프로토콜로 차단 | IPS/DPI 오탐 | §1.1. 평문이라 DPI 가 페이로드를 본다. 예외 등록 요청 |
+| 오프라인 Agent 에 명령이 안 쌓임 | **구독 QoS 가 0** | 구독에 `-q 1`. QoS 0 은 큐잉 대상이 아니다 (§7.5) |
+| 발행이 성공하는데 아무도 못 받음 | ACL 거부인데 MQTT 3.1.1 로 확인 | `-V 5` 로 PUBACK 사유 코드 확인. `RC:135` = 거부 (§7.4) |
+| 재접속했는데 큐가 비어 있음 | clientId 불일치 또는 세션 만료 | `-i <agentId>` 고정, `-x` 를 메시지 만료보다 길게 (§7.5) |
 
 **[호스트]** — 브로커 로그 확인:
 ```bash
 cd /srv/mqtt && docker compose logs --tail 100 -f
 ```
 
-**[컨테이너 내부]** — 현재 접속 수 조회. 이 가이드에서 **유일하게 돌고 있는 컨테이너 안에서 실행하는 명령**이다:
+**[컨테이너 내부]** — 현재 접속 수 조회. 돌고 있는 컨테이너 안에서 실행하는 명령은 이것과 §8.5 의 같은 명령 **둘뿐**이다:
 ```bash
 docker exec mqtt-broker mosquitto_sub -h localhost -p 1883 \
   -u ops -P '<ops 비밀번호>' -t '$SYS/broker/clients/connected' -C 1
