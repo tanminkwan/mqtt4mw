@@ -1248,6 +1248,99 @@ sudo ls -lh /sw/docker/mqtt/data/mosquitto.db        # 큐 크기 추이
 ---
 
 
+### 8.7 설정 파일 수정
+
+`mosquitto.conf`·`acl` 은 `1883:1883` 소유에 권한 `600` 이다. **호스트에는 uid 1883 계정이 없으므로 일반 사용자로는 열리지도 않는다:**
+
+```bash
+cat /sw/docker/mqtt/config/mosquitto.conf
+# → cat: ...: Permission denied
+```
+
+`sudo` 로만 접근할 수 있다. root 는 권한 비트와 무관하게 읽고 쓴다.
+
+#### 수정 방법
+
+**방법 A — 편집기** (일부만 고칠 때)
+```bash
+sudo vi /sw/docker/mqtt/config/mosquitto.conf
+```
+
+**방법 B — 전체 교체** (§4.1 처럼 통째로 다시 쓸 때)
+```bash
+sudo tee /sw/docker/mqtt/config/mosquitto.conf >/dev/null <<'CONF'
+... 내용 ...
+CONF
+```
+
+**방법 C — 한 줄 치환**
+```bash
+sudo sed -i 's/^max_queued_messages .*/max_queued_messages 200/' \
+  /sw/docker/mqtt/config/mosquitto.conf
+```
+
+#### 수정 후 반드시 권한을 다시 확인한다
+
+```bash
+sudo ls -l /sw/docker/mqtt/config/
+```
+
+기대: `-rw------- 1 1883 1883`
+
+**`sudo tee` 는 파일을 새로 만들므로 항상 `root:root 644` 가 된다.** 편집기도 저장 방식에 따라 소유자가 root 로 바뀔 수 있다. 어긋나 있으면 되돌린다:
+
+```bash
+sudo chown 1883:1883 /sw/docker/mqtt/config/mosquitto.conf
+sudo chmod 600 /sw/docker/mqtt/config/mosquitto.conf
+```
+
+> 이걸 빠뜨리면 다음 기동에서 `world readable permissions` 경고가 뜨고, mosquitto 상위 버전에서는 **브로커가 아예 뜨지 않는다**(§2.2).
+
+#### 반영 방법 — SIGHUP 과 재시작을 구분한다
+
+```bash
+docker kill -s HUP mqtt-broker        # 대부분의 설정. 접속 유지
+```
+
+브로커 로그에 `Reloading config.` 가 찍히면 반영된 것이다.
+
+| 변경 항목 | 반영 방법 |
+|---|---|
+| `password_file`, `acl_file` 내용 | **SIGHUP** |
+| `connection_messages`, `log_type` | **SIGHUP** |
+| `max_queued_messages`, `max_inflight_messages` | **SIGHUP** |
+| `persistent_client_expiration` | **SIGHUP** |
+| **`listener` 추가·삭제** | **재시작** |
+| **리스너의 TLS 인증서 경로** | **재시작** |
+
+리스너를 바꾸고 SIGHUP 을 보내면 조용히 무시되지 않고 다음 오류가 남는다:
+
+```
+Reloading config.
+Error: It is not currently possible to add/remove listeners when reloading the config file.
+```
+
+**이 줄이 보이면 재시작해야 한다.** 재시작은 300대 동시 재접속을 유발하므로 §8.5 를 함께 본다.
+
+```bash
+cd /sw/docker/mqtt && docker compose restart
+docker compose logs --tail 20        # Opening ipv4 listen socket on port ... 확인
+```
+
+#### 수정 전 백업
+
+```bash
+sudo cp -p /sw/docker/mqtt/config/mosquitto.conf \
+           /sw/docker/mqtt/config/mosquitto.conf.$(date +%F)
+```
+
+`-p` 가 소유자와 권한을 함께 보존한다. 되돌릴 때 `chown` 을 다시 할 필요가 없다.
+
+> ⚠️ 백업본을 `config/` 안에 두면 브로커가 읽지는 않지만(`-c` 로 지정한 파일만 읽는다) 설정 디렉터리가 지저분해진다. 장기 보관은 `/var/backups/` 로 옮긴다.
+
+---
+
+
 ## 9. 트러블슈팅
 
 > **[호스트]** — 접속 수 조회만 **[컨테이너 내부]**
@@ -1263,6 +1356,9 @@ sudo ls -lh /sw/docker/mqtt/data/mosquitto.db        # 큐 크기 추이
 | 재시작 후 명령이 조용히 사라짐 | `data/` 유실 → 세션 없음 | §8.4 복원 |
 | 두 Agent 가 무한 재접속 | clientId 충돌 (session takeover) | 한 호스트·한 계정으로 Agent 를 두 개 띄운 경우. agentId 가 겹친다 (§5.1) |
 | 브로커 호스트 디스크 고갈 | Agent 재접속 반복 → 접속 로그 누적 | §2.3 로테이션. 근본 원인은 §7.8(idle timeout) 또는 clientId 충돌 |
+| 설정 파일이 `Permission denied` | `1883:1883 600` 소유 | `sudo` 로 연다. 호스트에 uid 1883 계정은 없다 (§8.7) |
+| 설정을 고쳤는데 반영이 안 됨 | SIGHUP 미전송 또는 리스너 변경 | §8.7. 리스너 추가·삭제는 **재시작**이 필요하다 |
+| SIGHUP 후 `not currently possible to add/remove listeners` | 리스너를 바꾸고 SIGHUP 을 보냄 | `docker compose restart` (§8.7) |
 | 미상 프로토콜로 차단 | IPS/DPI 오탐 | §1.1. 평문이라 DPI 가 페이로드를 본다. 예외 등록 요청 |
 | 오프라인 Agent 에 명령이 안 쌓임 | **구독 QoS 가 0** | 구독에 `-q 1`. QoS 0 은 큐잉 대상이 아니다 (§7.5) |
 | 발행이 성공하는데 아무도 못 받음 | ACL 거부인데 MQTT 3.1.1 로 확인 | `-V 5` 로 PUBACK 사유 코드 확인. `RC:135` = 거부 (§7.4) |
