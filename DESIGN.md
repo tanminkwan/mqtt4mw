@@ -156,7 +156,7 @@ Agent 는 상태를 발행하지 않는다(subscribe only). `evt/{agentId}/statu
 > 1. **배포 순서를 운영 규칙으로 고정** — Agent를 먼저 띄워 세션을 만들고 나서 명령을 보낸다.
 > 2. **미도달 감지는 REST 결과 경로에 위임** — 결과가 오지 않으면 그쪽에서 타임아웃으로 처리한다(§14).
 >
-> 세션 존재 여부를 MQTT 로 확인할 수단은 없다. Agent 가 상태를 발행하지 않으므로(§3.3) retain 조회도 불가능하다. 브로커 로그(`connection_messages true`, §7.1)에서 CONNECT 기록을 보는 것이 유일한 방법이다.
+> 세션 존재 여부를 MQTT 로 확인할 수단은 없다. Agent 가 상태를 발행하지 않으므로(§3.3) retain 조회도 불가능하다. 브로커 로그(`connection_messages true`, §7)에서 CONNECT 기록을 보는 것이 유일한 방법이다.
 
 ---
 
@@ -189,22 +189,19 @@ Mosquitto에는 계정 발급·등록 API가 없다. Agent가 "계정을 달라"
 
 해시와 평문이 **서로 다른 경로로** 나간다. 브로커는 평문을 가진 적이 없고, 발급한 적도 없다. `mosquitto_passwd` 는 브로커 데몬과 별개의 CLI이며 브로커가 떠 있지 않아도 동작한다.
 
-#### 일괄 생성
+#### 계정명은 agentId 와 일치해야 한다
 
-```bash
-: > broker/config/passwd                      # 새로 시작할 때만
-for i in $(seq -f "%03g" 1 300); do
-  PW=$(openssl rand -base64 24)               # ~144 bit. 사람이 외울 일이 없으니 길게
-  docker run --rm -v "$PWD/broker/config:/mosquitto/config" eclipse-mosquitto:2.0 \
-    mosquitto_passwd -b /mosquitto/config/passwd "agent-$i" "$PW"
-  echo "agent-$i,$PW" >> /dev/shm/agent-creds.csv     # tmpfs. 배포 직후 파기
-done
-chown 1883:1883 broker/config/passwd && chmod 600 broker/config/passwd
+§5.2 ACL 이 `%u`(접속 username) 치환에 의존하므로 계정명은 §2.1 의 agentId 와 **정확히 같아야 한다.**
+
+```
+username = clientId = agentId = ${HOSTNAME}_${USER}_J
 ```
 
 - 생성 결과인 `password_file` 은 `username:$7$...` 형태의 해시 목록이다. 평문은 없다.
-- 배포용 CSV는 **디스크에 남기지 않는다**(tmpfs 사용). 배포 후 즉시 삭제.
+- 배포용 평문 목록은 **디스크에 남기지 않는다**(tmpfs 사용). 배포 후 즉시 삭제.
 - `.gitignore` 에 `broker/config/passwd` 가 있어야 한다.
+
+> 300대 일괄 생성 스크립트는 [INSTALL.md](INSTALL.md) §5.3 에 있다.
 
 #### Agent 측 보관
 
@@ -226,7 +223,7 @@ Java 쪽에서는 읽은 뒤 로그·예외 메시지에 절대 싣지 않는다
 
 #### 헬스체크 자격증명 — 숨기지 말고 무력화한다
 
-§7.2 의 healthcheck는 compose 파싱 시점에 값이 컨테이너 설정에 박혀 **`docker inspect` 로 평문 노출**된다. 이를 숨기려 애쓰는 대신, **노출돼도 아무것도 못 하는 계정**을 쓴다.
+헬스체크 자격증명은 compose 파싱 시점에 값이 컨테이너 설정에 박혀 **`docker inspect` 로 평문 노출**된다. 이를 숨기려 애쓰는 대신, **노출돼도 아무것도 못 하는 계정**을 쓴다.
 
 ```
 user health
@@ -239,11 +236,7 @@ topic read  $SYS/broker/uptime      # 이 토픽 하나. 발행 권한 없음
 
 Mosquitto는 **SIGHUP으로 `password_file` 을 재읽기**하며 기존 연결을 끊지 않는다. 인증은 CONNECT 시점에만 일어나기 때문이다.
 
-```bash
-docker run --rm -v "$PWD/broker/config:/mosquitto/config" eclipse-mosquitto:2.0 \
-  mosquitto_passwd -b /mosquitto/config/passwd agent-001 '<new-pw>'
-docker kill -s HUP mqtt-broker          # 재시작 아님. 300대 연결 유지됨
-```
+즉 **비밀번호 갱신에 브로커 재시작이 필요 없다.** 300대 연결이 유지된 채로 바뀐다(절차는 [INSTALL.md](INSTALL.md) §8.1).
 
 순서가 중요하다. 브로커를 먼저 갱신하면 해당 Agent는 **접속 중에는 살아 있지만 재접속하는 순간 실패**한다. 따라서:
 
@@ -266,7 +259,7 @@ docker kill -s HUP mqtt-broker          # 재시작 아님. 300대 연결 유지
 | 시계 의존 | 없음 | X.509 유효기간을 **로컬 시계로 검증** |
 | 폐쇄망 갱신 | 파일 갱신 + SIGHUP | 300장 재발급·재배포 |
 
-배포 부담이 비슷한데 **만료라는 실패 모드만 추가**된다. NTP를 쓰지 않으므로(§3.1) 시계가 밀린 호스트가 유효한 인증서를 거부할 수 있고, 폐쇄망은 만료 알림도 오지 않는다(§15.4). **전송 구간 TLS(서버 인증서)는 유지하되, 클라이언트 인증은 `password_file` 로 간다.**
+배포 부담이 비슷한데 **만료라는 실패 모드만 추가**된다. NTP를 쓰지 않으므로(§3.1) 시계가 밀린 호스트가 유효한 인증서를 거부할 수 있고, 폐쇄망은 만료 알림도 오지 않는다(§15.3). **전송 구간 TLS(서버 인증서)는 유지하되, 클라이언트 인증은 `password_file` 로 간다.**
 
 #### clientId 충돌
 
@@ -302,11 +295,12 @@ pattern read  cmd/broadcast/req
 
 > 기동 시 `Warning: ACL pattern 'cmd/broadcast/req' does not contain '%c' or '%u'` 경고가 뜬다. `pattern` 행에 치환 문자가 없어서 나는 것이며, **모든 인증 사용자에게 적용되는 규칙으로 정상 동작한다**(실측 확인 — Agent 2대가 broadcast 를 함께 수신). 경고가 싫으면 계정별 `topic read cmd/broadcast/req` 로 풀어 쓸 수 있으나 300줄이 반복되므로 `pattern` 유지를 권한다.
 
-### 5.3 운영 환경 추가 조치
-- 8883 포트 + TLS(서버 인증서). 사내망이라도 `allow_anonymous false`는 필수.
-- 강화 시 mTLS(클라이언트 인증서) + `use_identity_as_username true` → 인증서 CN이 username이 되어 위 ACL 패턴 그대로 동작.
-- 자격증명은 Agent 측 설정파일(권한 600) 또는 환경변수로 주입. 코드/이미지에 넣지 않는다.
-- 운영은 **인터넷 불가 폐쇄망**이다. 방화벽 신청과 사내 CA 인증서 발급이 선행되어야 하므로 §15를 함께 본다.
+### 5.3 운영 환경 전제
+
+- **전송 구간 TLS(8883, 서버 인증서).** 평문 구간에서는 비밀번호가 CONNECT 패킷에 그대로 실려 나가므로, `password_file` 인증이 실질적으로 무력해진다. 사내망이라도 `allow_anonymous false` 는 별개로 필수다.
+- 강화 시 mTLS + `use_identity_as_username true` → 인증서 CN 이 username 이 되어 §5.2 ACL 패턴이 그대로 동작한다. 채택하지 않은 이유는 아래 표 참조.
+- 자격증명은 Agent 측 **설정파일(권한 600)** 로 주입한다. 코드·이미지에 넣지 않는다.
+- 제약 조건은 §15, 설치 절차는 [INSTALL.md](INSTALL.md).
 
 ---
 
@@ -345,79 +339,29 @@ mqtt/
 
 ---
 
-## 7. 브로커 설정
+## 7. 브로커 설정 — 값의 근거
 
-### 7.1 `broker/config/mosquitto.conf`
+설정 파일 전문과 배포 절차는 **[INSTALL.md](INSTALL.md) §4·§6** 에 있다. 여기서는 각 값을 왜 그렇게 정했는지만 남긴다.
 
-```conf
-listener 1883
-protocol mqtt
+| 설정 | 값 | 근거 |
+|---|---|---|
+| `allow_anonymous` | `false` | 사내망이라도 필수. 계정 분리가 §5.2 ACL 의 전제다 |
+| `persistence` | `true` | 컨테이너 재시작에도 오프라인 큐 유지 (§16.1-A) |
+| `autosave_interval` | `30` | 크래시 시 최대 30초분 손실. 명령 성격상 허용 범위 |
+| `persistent_client_expiration` | `7d` | 명령 만료(1h)보다 충분히 길게. Agent `sessionExpiryInterval`(24h, §4)의 **상한**으로도 작동한다 |
+| `max_queued_messages` | `100` | 명령은 1h 에 자동 소멸하므로 1000건을 쌓을 이유가 없다 (§12.5) |
+| `max_inflight_messages` | `20` | QoS 1 동시 처리 한도 |
+| `memory_limit` | `512MB` | 오프라인 큐 폭주 시 브로커 자체를 보호 (§12.5) |
+| `connection_messages` | `true` | 접속/해제 로그. §16.7 로그량 산정의 전제 |
 
-allow_anonymous false
-password_file /mosquitto/config/passwd
-acl_file /mosquitto/config/acl
+**MQTT 5 관련 설정은 없다.** mosquitto 2.0 은 3.1.1 과 5.0 을 같은 리스너에서 동시에 받으며, `Message Expiry Interval` 처리는 기본 동작이다. 프로토콜 버전은 클라이언트가 CONNECT 시점에 결정한다(§8).
 
-# 세션/메시지 영속화 — 컨테이너 재시작에도 오프라인 큐 유지
-persistence true
-persistence_location /mosquitto/data/
-autosave_interval 30
+`per_listener_settings` 는 기본값 `false` 를 유지한다. `password_file`·`acl_file`·`allow_anonymous` 가 전 리스너에 공통 적용되므로, **TLS 리스너를 추가해도 §5 의 인증·인가가 그대로 따라온다.** `true` 로 바꾸면 durable 클라이언트가 "마지막에 접속했던 리스너"의 ACL 을 따르게 되어, 리스너 전환 중 권한이 꼬인다.
 
-# 오프라인 Agent 세션 보존 기간. 명령 만료(1h)보다 충분히 길게 잡는다.
-# Agent 가 CONNECT 에 실은 sessionExpiryInterval(24h, §4)의 상한으로도 작동한다.
-persistent_client_expiration 7d
-
-# 세션당 큐 상한 — 명령은 1h 에 자동 소멸하므로 1000건을 쌓을 이유가 없다 (§12.5)
-max_queued_messages 100
-max_inflight_messages 20
-memory_limit 512MB
-
-log_dest stdout
-log_type error
-log_type warning
-log_type notice
-log_type information
-connection_messages true
-```
-
-### 7.2 `docker-compose.yml`
-
-```yaml
-services:
-  broker:
-    image: eclipse-mosquitto:2.0     # 폐쇄망: 사내 레지스트리 경로로 교체
-    container_name: mqtt-broker
-    restart: unless-stopped
-    ports:
-      - "1883:1883"
-    volumes:
-      - ./broker/config:/mosquitto/config:ro
-      - ./broker/data:/mosquitto/data
-      - ./broker/log:/mosquitto/log
-    healthcheck:
-      # central 은 읽기 권한이 없다(§5.2). health 전용 계정을 쓴다
-      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-p", "1883",
-             "-u", "health", "-P", "${MQTT_HEALTH_PW}",
-             "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-```
-
-- `data/`는 컨테이너 내 uid 1883이 써야 하므로 초기 1회 `chown -R 1883:1883 broker/data broker/log`.
-- `passwd` 생성 (PoC용 최소 예시. **Agent 300개 일괄 생성과 배포·갱신 절차는 §5.1**):
-  ```bash
-  docker run --rm -v "$PWD/broker/config:/mosquitto/config" eclipse-mosquitto:2.0 \
-    mosquitto_passwd -c -b /mosquitto/config/passwd central '<pw>'    # -c 는 최초 1회만
-  docker run --rm -v "$PWD/broker/config:/mosquitto/config" eclipse-mosquitto:2.0 \
-    mosquitto_passwd -b /mosquitto/config/passwd health '<pw>'        # healthcheck 전용
-  docker run --rm -v "$PWD/broker/config:/mosquitto/config" eclipse-mosquitto:2.0 \
-    mosquitto_passwd -b /mosquitto/config/passwd agent-001 '<pw>'
-  ```
-  `.env` 에 `MQTT_CENTRAL_PW`, `MQTT_HEALTH_PW` 를 둔다 (권한 600, `.gitignore` 포함).
-- 로컬 개발 단계에서만 `allow_anonymous true` + ACL 미적용으로 단순화 가능. 단, PoC 통과 직후 인증을 켜는 것을 전제로 한다.
-- **MQTT 5 관련 설정은 없다.** mosquitto 2.0은 3.1.1과 5.0을 같은 리스너에서 동시에 받으며, `Message Expiry Interval` 처리는 기본 동작이다. 클라이언트 쪽 프로토콜 버전만 올리면 된다(§8).
+> 헬스체크에 `central` 을 쓰면 안 된다. `central` 은 읽기 권한이 없어 ACL 이 구독을 거부하고 **컨테이너가 unhealthy 로 재시작을 반복한다.** `health` 전용 계정을 쓴다(§5.1).
 
 ---
+
 
 ## 8. 구현 골격
 
@@ -566,6 +510,8 @@ public interface ResultReporter {
 
 ## 9. 검증 절차 (PoC → 통합 순서)
 
+> **개발 단계의 검증 순서다.** 운영 설치 후의 인수 검증은 [INSTALL.md](INSTALL.md) §7 을 쓴다. 여기 §9-2·§9-3·§9-9 에서 확인된 함정(`-x` 오용, SUBACK 판정 불가, 세션 만료 역전)이 그쪽 절차의 근거다.
+
 1. **브로커 단독**
    ```bash
    docker compose up -d broker && docker compose logs -f broker
@@ -631,12 +577,12 @@ public interface ResultReporter {
 
 **선행 (운영 폐쇄망 — 리드타임이 길다. 구현과 병행 착수)**
 
-- [ ] **방화벽 신청** 6개 항목 (§15.2)
-- [ ] **사내 CA 인증서 발급 신청** — SAN에 FQDN + IP (§15.4)
+- [ ] **방화벽 신청** — 항목·신청서 양식은 [INSTALL.md](INSTALL.md) §1.1
+- [ ] **사내 CA 인증서 발급 신청** — SAN 에 FQDN + IP (§15.3)
 
 **구현**
 
-- [ ] `broker/config/{mosquitto.conf,acl}` 작성, `passwd` 생성, `docker compose up`
+- [ ] 브로커 기동 — [INSTALL.md](INSTALL.md) §2~§6
 - [ ] §9-2, §9-3 CLI 단방향 전달 및 ACL 격리 검증 (`central` 읽기 거부 포함)
 - [ ] Java Agent: **mqttv5 클라이언트로 마이그레이션** + `sessionExpiryInterval 86400` + `cmd/{agentId}/req` 구독 (발행 없음)
 - [ ] Python 컨트롤러: **`protocol=mqtt.MQTTv5`** + `send()` 발행 전용 + `MessageExpiryInterval 3600`
@@ -645,13 +591,13 @@ public interface ResultReporter {
 - [ ] **§9-9 만료 검증** — 미배달 폐기(a), 잔여 만료 배달(b), 세션 만료 역전(c)
 - [ ] `ResultReporter` 인터페이스 확정 후 결과 경로 담당에 §14 계약 전달
 - [ ] systemd unit + graceful shutdown(offline 발행)
-- [ ] TLS(8883) 적용 및 자격증명 외부 주입
+- [ ] TLS(8883) 적용 및 자격증명 외부 주입 — [INSTALL.md](INSTALL.md) 부록 A
 - [ ] §12 리스크 검증 (오프라인 큐 메모리 상한, 재접속 폭주)
 
 **폐쇄망 배포**
 
-- [ ] §15.5 배포 순서대로 기동, `nc`/`openssl s_client` 로 경로 확인
-- [ ] **1시간 유휴 후 명령 도달 테스트** — 방화벽 idle timeout 검증 (§15.3-a)
+- [ ] [INSTALL.md](INSTALL.md) §7 설치 검증 8단계 수행
+- [ ] **1시간 유휴 후 명령 도달 테스트** — 방화벽 idle timeout 검증 (§15.2-a)
 
 ---
 
@@ -907,134 +853,63 @@ public interface ResultReporter {
 
 ---
 
-## 15. 폐쇄망(air-gapped) 운영 가이드
+## 15. 네트워크 제약
 
-운영 환경은 인터넷이 차단된 폐쇄망이다. 선행 과제는 **방화벽 신청**과 **사내 CA 인증서 발급** 두 가지이며, 둘 다 리드타임이 길다. **구현보다 먼저 착수한다.**
+운영 환경은 인터넷이 차단된 폐쇄망이다. **방화벽 신청서·인증서 발급·배포 절차는 [INSTALL.md](INSTALL.md) §1 에 있다.** 여기서는 설계에 영향을 준 제약만 남긴다.
 
-> 아티팩트(이미지·라이브러리) 반입 절차는 이 문서의 범위가 아니다. 사내 표준 반입 프로세스를 따른다.
+### 15.1 연결 방향 — 전부 클라이언트 → 브로커
 
-### 15.1 통신 흐름 — 방화벽 신청의 근거
+MQTT 의 가장 중요한 성질부터 짚는다.
 
-MQTT의 가장 중요한 성질부터 짚는다.
+> **모든 TCP 연결은 클라이언트(Agent·중앙서버)가 브로커로 맺는다. 브로커가 Agent 에게 connect back 하는 일은 없다.**
 
-> **모든 TCP 연결은 클라이언트(Agent·중앙서버)가 브로커로 맺는다. 브로커가 Agent에게 connect back 하는 일은 없다.**
-
-명령이 서버 → Agent 방향으로 흐르지만, 그것은 **Agent가 이미 맺어둔 상시 연결 위로 내려가는 것**이다. 따라서 방화벽은 **Agent → 브로커 단방향만** 열면 된다. 역방향(브로커 → Agent) 정책은 **신청하지 않는다.** 이 점을 신청서에 명시하지 않으면 보안팀이 불필요한 역방향 정책을 요구하거나, 반대로 "서버가 Agent에 명령을 보내는데 왜 단방향이냐"는 반려 사유가 된다.
+명령이 서버 → Agent 방향으로 흐르지만, 그것은 **Agent 가 이미 맺어둔 상시 연결 위로 내려가는 것**이다.
 
 ```
-                       ┌──────────────────────────────────────┐
-                       │  전부 클라이언트 → 브로커 방향 연결    │
-                       └──────────────────────────────────────┘
-
- Python 중앙서버 ──(1) TCP 8883 ──▶ ┌───────────┐
-                                    │  Broker   │
- Java Agent × 300 ─(2) TCP 8883 ──▶ │  :8883    │
-        │                           └───────────┘
+ Python 중앙서버 ──(1)──▶ ┌───────────┐
+                          │  Broker   │
+ Java Agent × 300 ─(2)──▶ └───────────┘
         │
-        ├─(3) TCP 443 ──▶ Python 중앙서버    ※ 결과 전송(REST, 범위 밖)
-        │
-        └─(4) TCP/UDP 53 ──▶ 사내 DNS        ※ /etc/hosts 로 대체 가능
+        ├─(3) TCP 443 ──▶ Python 중앙서버    ※ 결과 전송(REST, §14)
+        └─(4) TCP/UDP 53 ─▶ 사내 DNS
 ```
 
-### 15.2 방화벽 신청서
+설계상 귀결 셋:
 
-그대로 복사해 쓸 수 있는 형태다. 출발지는 개별 IP 300개가 아니라 **대역(CIDR)으로 신청**한다.
+- **역방향 방화벽 정책이 불필요하다.** 신청서에 명시하지 않으면 보안팀이 불필요한 역방향 정책을 요구하거나, "서버가 Agent 에 명령을 보내는데 왜 단방향이냐"는 반려 사유가 된다.
+- **NAT 뒤의 Agent 도 그대로 동작한다.** Kafka 가 `advertised.listeners` 의 모든 브로커에 직접 연결을 요구하는 것과 대비된다(§13.2-e).
+- **결과는 MQTT 로 돌아오지 않고 REST 로 나간다**(§14). Agent 를 subscribe only 로 확정한 근거이며, `Response Topic`/`Correlation Data` 를 쓰지 않는 이유다.
 
-| # | 출발지 | 목적지 | 프로토콜/포트 | 방향 | 용도 | 비고 |
-|---|---|---|---|---|---|---|
-| 1 | 중앙서버 IP | 브로커 IP | **TCP 8883** | 단방향 | MQTT over TLS — 명령 발행 | 상시 연결 1개 |
-| 2 | Agent 대역 `10.x.y.0/24` | 브로커 IP | **TCP 8883** | 단방향 | MQTT over TLS — 명령 수신 | **상시 연결 300개** |
-| 3 | Agent 대역 `10.x.y.0/24` | 중앙서버 IP | TCP 443 | 단방향 | 실행 결과 REST 전송 | 범위 밖(§14)이나 **함께 신청** |
-| 4 | 중앙서버 + Agent 대역 | 사내 DNS | TCP/UDP 53 | 단방향 | 브로커 FQDN 해석 | `/etc/hosts` 고정 시 생략 가능 |
-| 5 | 운영 단말 | 브로커 IP | TCP 8883 | 단방향 | CLI 점검(`mosquitto_sub`) | 운영자 대역만. 선택 |
-| 6 | 배포 서버 | 사내 레지스트리 | TCP 443 | 단방향 | 이미지 pull | 초기 배포 시 1회 |
+### 15.2 상시 연결이 만드는 제약
 
-신청서 특기사항란에 넣을 문구:
+**(a) idle timeout — keepAlive 설계와 직결된다**
 
-```
-- 본 통신은 클라이언트(Agent/중앙서버) → 브로커 방향의 단방향 TCP 세션입니다.
-  브로커에서 Agent로 신규 연결을 시도하지 않으므로 역방향 정책은 불필요합니다.
-- MQTT 프로토콜 특성상 세션을 장시간 유지하는 상시 연결(persistent connection)입니다.
-  세션당 keepAlive 30초 간격으로 2바이트 PINGREQ가 발생합니다.
-- 방화벽 TCP idle timeout 을 60초 이상으로 설정 요청드립니다. (권장 3600초)
-- 평문 1883 이 아닌 TLS 8883 만 사용합니다.
-```
+MQTT 연결은 명령이 없으면 30초에 한 번 2바이트 PINGREQ 만 흐른다. 방화벽·L4 가 이를 유휴로 보고 세션을 끊으면, **양쪽 모두 끊긴 줄 모르는 half-open 상태**가 된다. 서버는 정상 publish 하고 PUBACK 도 받지만 Agent 에는 영영 도달하지 않는다.
 
-> 평문 1883으로 먼저 PoC를 한다면 1883도 함께 신청해두고, 운영 전환 시 닫는다. **방화벽 재신청은 리드타임이 다시 발생**하므로 처음에 두 포트를 함께 올리는 편이 빠르다.
+- **keepAlive 30s(§4) < idle timeout** 이어야 한다. 이 부등식이 §4 keepAlive 값의 상한을 정한다.
+- 세션을 끊을 때 RST 를 보내지 않고 조용히 버리는(silent drop) 장비가 있다. 이 경우 Agent 는 keepAlive 타임아웃(30s × 1.5 ≈ 45초)으로 스스로 감지해 재접속한다. §4 의 `setAutomaticReconnect(true)` 가 이 상황의 안전장치다.
+- L4 로드밸런서·리버스 프록시를 경유시키면 같은 문제가 재발한다. 경유 계층을 늘리지 않는 편이 낫다.
 
-### 15.3 방화벽 설정 함정 3가지
+**(b) NAT 세션 테이블**
 
-**(a) TCP idle timeout — 가장 흔한 사고**
-
-MQTT 연결은 명령이 없으면 30초에 한 번 2바이트 PINGREQ만 흐른다. 방화벽·L4가 이를 유휴로 보고 세션을 끊으면, **양쪽 모두 끊긴 줄 모르는 half-open 상태**가 된다. 서버는 정상 publish하고 PUBACK도 받지만 Agent에는 영영 도달하지 않는다.
-
-- keepAlive 30s(§4) < idle timeout 이어야 한다. 방화벽 기본값이 300~3600초면 안전하다.
-- 단, **세션을 끊을 때 RST를 보내지 않고 조용히 버리는(silent drop) 장비**가 있다. 이 경우 Agent는 keepAlive 타임아웃(30s × 1.5 ≈ 45초)으로 스스로 감지해 재접속한다. §4의 `setAutomaticReconnect(true)` 가 이 상황의 안전장치다.
-- 검증: Agent를 붙여놓고 **1시간 이상 무명령 방치 후** 명령이 정상 도달하는지 확인한다. §9에 없던 폐쇄망 전용 항목이다.
-
-**(b) NAT 세션 테이블 고갈**
-
-Agent 300대가 NAT를 경유하면 상시 세션 300개가 테이블에 영구 점유된다. 일반 트래픽과 달리 **회수되지 않는다.** NAT 장비의 세션 상한과 현재 사용률을 신청 단계에서 확인한다. 300개는 보통 문제없지만, 장비를 공유하는 다른 시스템이 있으면 고지가 필요하다.
+Agent 300대가 NAT 를 경유하면 상시 세션 300개가 테이블에 영구 점유된다. 일반 트래픽과 달리 **회수되지 않는다.**
 
 **(c) IPS/DPI 오탐**
 
-1883/8883은 IANA 등록 포트(`mqtt`/`secure-mqtt`)라 대부분의 장비가 인식한다. 다만 애플리케이션 검사가 켜져 있으면 다음이 발생할 수 있다.
+1883/8883 은 IANA 등록 포트(`mqtt`/`secure-mqtt`)라 대부분의 장비가 인식한다. 다만 MQTT 시그니처가 없는 장비는 미상 프로토콜로 분류해 차단할 수 있고, 페이로드 재조립 과정에서 지연이 발생할 수 있다. TLS 를 쓰면 DPI 가 내용을 못 보므로 대부분 우회된다 — 폐쇄망이라도 TLS 를 권하는 실무적 이유가 하나 더 있는 셈이다.
 
-- MQTT 시그니처가 없는 장비가 미상 프로토콜로 분류해 차단
-- 페이로드 재조립 과정에서 지연 발생
+### 15.3 TLS 인증서 — SAN 제약
 
-**TLS(8883)를 쓰면 DPI가 내용을 못 보므로 대부분 우회된다.** 폐쇄망이라도 TLS를 권장하는 실무적 이유가 하나 더 있는 셈이다. 차단이 의심되면 브로커 로그의 `connection_messages`(§7.1)와 Agent 측 `connectionLost` 로그를 대조한다.
+폐쇄망이라 Let's Encrypt 등 공인 CA 의 자동 발급이 불가능하다. **사내 CA 발급**을 기준으로 한다(self-signed 는 PoC 용. 만료 관리가 수동이라 300대 배포 시 갱신이 지옥이 된다).
 
-### 15.4 TLS 인증서 — 폐쇄망에서는 사내 CA
-
-Let's Encrypt 등 공인 CA의 자동 발급이 불가능하다. 두 가지 중 택일한다.
-
-| 방식 | 판단 |
-|---|---|
-| **사내 CA 발급** | 권장. 이미 사내 PKI가 있으면 브로커 서버 인증서만 발급받으면 된다 |
-| self-signed | PoC용. 만료 관리가 수동이라 300대 배포 시 갱신이 지옥이 된다 |
-
-발급 시 **SAN(Subject Alternative Name)에 브로커의 FQDN과 IP를 모두 포함**시킨다. 폐쇄망에서는 DNS 없이 IP로 접속하는 경우가 잦은데, SAN에 IP가 없으면 인증서 검증이 실패한다.
-
-Agent 측 truststore 등록:
-```bash
-# Java — 사내 CA 를 truststore 에 import
-keytool -importcert -alias corp-ca -file corp-ca.crt \
-        -keystore agent-truststore.jks -storepass '<pw>' -noprompt
-```
-```python
-# Python — paho
-self.c.tls_set(ca_certs="/etc/pki/corp-ca.crt")
-```
+발급 시 **SAN 에 브로커의 FQDN 과 IP 를 모두 포함**시킨다. 폐쇄망에서는 DNS 없이 IP 로 접속하는 경우가 잦은데, SAN 에 IP 가 없으면 인증서 검증이 실패한다.
 
 인증서 만료일을 **배포 시점에 자산 목록으로 기록**한다. 폐쇄망은 만료 알림이 오지 않아 그대로 서비스가 멈춘다.
 
-### 15.5 배포 순서 (폐쇄망 반영)
-
-§9의 검증 절차 앞에 붙는 선행 단계다.
-
-1. 방화벽 신청 (§15.2) — **리드타임 확인. 가장 먼저 착수**
-2. 사내 CA 인증서 발급 신청 (§15.4) — SAN에 FQDN + IP
-3. 브로커 기동 → **방화벽 소통 확인**
-   ```bash
-   # Agent 호스트에서 — 애플리케이션 없이 경로만 먼저 확인
-   nc -zv <broker-ip> 8883
-   openssl s_client -connect <broker-ip>:8883 -CAfile corp-ca.crt </dev/null
-   ```
-4. §9 검증 절차 수행
-5. **§15.3-(a) 장시간 유휴 테스트** — 1시간 방치 후 명령 도달 확인
-
-### 15.6 착수 전 체크리스트
-
-- [ ] 방화벽 신청 6개 항목 접수 (§15.2) — DNS 항목 필요 여부 확인
-- [ ] 방화벽 TCP idle timeout ≥ 60초 확인 (§15.3-a)
-- [ ] NAT 경유 여부 및 세션 테이블 여유 확인 (§15.3-b)
-- [ ] Agent 대역 CIDR 확정 (개별 IP 300개 신청 금지)
-- [ ] 사내 CA 인증서 발급 — SAN에 FQDN **및 IP** 포함 (§15.4)
-- [ ] `corp-ca.crt` — Java truststore / Python ca_certs 양쪽 배포
-- [ ] 인증서 만료일 자산 등록
+> 발급 신청 절차와 truststore 배포 명령은 [INSTALL.md](INSTALL.md) 부록 A 에 있다.
 
 ---
+
 
 ## 16. 브로커 장애 시 동작
 
@@ -1176,7 +1051,7 @@ Agent 백오프 상한이 60초 + jitter(§4)이므로 대부분 이 안에 복�
 **정상 백오프는 감당 가능하다. 문제는 플래핑이다.** 백오프가 상한 60초에 도달하지 못하고 짧은 주기로 도는 경우가 실제로 더 흔하다.
 
 - 브로커가 **살아 있으나 불안정** — TCP 연결은 맺어지고 CONNACK 직후 끊김 → 백오프가 매번 1초로 리셋
-- **방화벽 idle timeout / silent drop** (§15.3-a) — 브로커는 멀쩡한데 세션만 계속 잘림
+- **방화벽 idle timeout / silent drop** (§15.2-a) — 브로커는 멀쩡한데 세션만 계속 잘림
 - 인증 실패·ACL 오설정 — 연결은 되는데 구독이 거부되어 재시도 루프
 
 이 경우 **브로커는 정상으로 보이는데 300대의 디스크가 조용히 차오른다.** 모니터링이 브로커만 보고 있으면 놓친다.
