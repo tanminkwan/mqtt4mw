@@ -54,8 +54,7 @@
 
 ```
 /sw/docker/mqtt/             ← 설치 루트
-├── docker-compose.yml          §6.1   docker:docker  644
-├── .env                        §6.2   docker:docker  600   ← health 비밀번호, UID/GID
+├── docker-compose.yml          §6.1   docker:docker  600   ← health 비밀번호·UID 포함
 ├── config/                     §2.1   docker:docker  700
 │   ├── mosquitto.conf          §4.1   docker:docker  600
 │   ├── acl                     §4.2   docker:docker  600
@@ -92,7 +91,7 @@
 mosquitto 이미지는 기본적으로 컨테이너 안의 `mosquitto`(uid 1883)로 동작하지만, 그러면 호스트 파일 소유자도 1883 으로 맞춰야 하고 그 `chown` 에 root 가 필요하다. 대신 **컨테이너를 `docker` 사용자의 uid 로 실행한다**(§6.1 `user:`).
 
 ```bash
-id -u    # 예: 1001  ← 이 값을 §6.2 .env 에 넣는다
+id -u    # 예: 1001  ← 이 값을 §6.1 compose 의 user: 에 적는다
 id -g
 ```
 
@@ -527,7 +526,7 @@ drwx------ 2 docker docker 4096 ... /sw/docker/mqtt/config
 | 계정 | 개수 | ACL 권한 | 받는 쪽 |
 |---|---|---|---|
 | `central` | 1 | `topic write cmd/#` — 300대 전체 명령 권한 | Python 중앙서버 |
-| `health` | 1 | `$SYS/broker/uptime` 읽기만 | 브로커 호스트 `.env` |
+| `health` | 1 | `$SYS/broker/uptime` 읽기만 | `docker-compose.yml` healthcheck |
 | `ops` | 1 | `$SYS/#` 읽기 | 운영자 단말 |
 | Agent | 300 | 자기 토픽만 (`%u` 치환) | 각 Agent 호스트 |
 
@@ -712,14 +711,15 @@ ls -l /sw/docker/mqtt/config/passwd
 
 평문 비밀번호는 `creds.csv` 에 `계정명,비밀번호` 형식으로 들어 있다. 해시(`passwd`)와 평문(`creds.csv`)은 **서로 다른 경로로** 나간다.
 
-#### (1) `health` → 브로커 호스트 `.env`
+#### (1) `health` → `docker-compose.yml` healthcheck
+
+값을 확인해 두었다가 **§6.1 compose 파일에 직접 기입**한다.
 
 ```bash
-HPW=$(grep '^health,' creds.csv | cut -d, -f2-)
-printf 'MQTT_HEALTH_PW=%s\n' "$HPW" >> /sw/docker/mqtt/.env
-chmod 600 /sw/docker/mqtt/.env
-ls -l /sw/docker/mqtt/.env
+grep '^health,' creds.csv | cut -d, -f2-
 ```
+
+> 이 값은 어차피 `docker inspect` 로 노출된다(§6.1). 숨기는 대신 **노출돼도 아무것도 못 하는 계정**을 쓰는 것이 이 설계의 전제다 — `health` 는 `$SYS/broker/uptime` 읽기 권한 하나뿐이다.
 
 #### (2) `central` → 중앙서버
 
@@ -786,14 +786,16 @@ ls /dev/shm/mqtt-prov      # No such file or directory 여야 한다
 
 > **[호스트] 작업 디렉터리: `/sw/docker/mqtt`**
 
-### 6.1 `/sw/docker/mqtt/docker-compose.yml`
+### 6.1 `docker-compose.yml` 생성
 
-```yaml
+```bash
+cd /sw/docker/mqtt
+tee docker-compose.yml >/dev/null <<'YML'
 services:
   broker:
     image: registry.corp.local/mqtt/eclipse-mosquitto:2.0.22
     container_name: mqtt-broker
-    user: "${MQTT_UID}:${MQTT_GID}"   # ★ docker 사용자로 실행. root/1883 을 쓰지 않는다
+    user: "1001:1001"                 # ★ id -u / id -g 값을 직접 적는다 (§2.2)
     restart: unless-stopped
     ports:
       - "1883:1883"
@@ -804,7 +806,7 @@ services:
     healthcheck:
       # central 은 읽기 권한이 없다(§4.2). health 전용 계정을 쓴다
       test: ["CMD", "mosquitto_sub", "-h", "localhost", "-p", "1883",
-             "-u", "health", "-P", "${MQTT_HEALTH_PW}",
+             "-u", "health", "-P", "<health 비밀번호>",
              "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
       interval: 30s
       timeout: 5s
@@ -813,36 +815,54 @@ services:
     logging:
       driver: json-file
       options: { max-size: "50m", max-file: "5" }
-    deploy:
-      resources:
-        limits: { cpus: "2", memory: 2G }
+    mem_limit: 2g
+YML
 ```
 
-Agent 300대는 Mosquitto 단일 노드 용량(~10k 커넥션)의 **3% 수준**이다. 1 vCPU / 1 GB 로 충분하며 위 값은 여유분이다.
+#### 리소스 제한에 대해
 
-### 6.2 `.env` (권한 600)
+Agent 300대는 Mosquitto 단일 노드 용량(~10k 커넥션)의 **3% 수준**이다. 1 vCPU / 1 GB 로 충분하며 `mem_limit: 2g` 는 여유분이다. 브로커 자체도 `memory_limit 512MB`(§4.1)로 내부에서 한 번 더 제한된다.
 
-`health` 비밀번호는 §5.8 에서 이미 넣었다. 여기에 **실행 UID/GID** 를 추가한다.
+> **CPU 제한은 두지 않는다.** Compose 버전에 따라 `cpus` 가 올바로 적용되지 않는다. 실측(Compose v2.3.3)에서 `deploy.resources.limits.cpus: "2"` 는 `NanoCpus=2`(2 CPU 가 아니라 2 나노CPU)로, `cpus: 2` 는 `NanoCpus=0`(미적용)으로 들어갔다. 메모리는 양쪽 다 정상이다.
+> 어차피 이 워크로드는 CPU 를 쓰지 않으므로 **제한을 걸어 얻을 것이 없고, 잘못 적용되면 브로커만 느려진다.** 적용 여부는 §6.3 에서 확인한다.
+
+### 6.2 값 기입과 권한
+
+**이 가이드는 `.env` 를 쓰지 않는다.** compose 의 `${...}` 치환을 쓰지 않고 값을 YAML 에 직접 적는다. 치환을 쓰면 값이 비었을 때 **오류가 아니라 빈 문자열로 조용히 진행**되기 때문이다:
+
+```
+level=warning msg="The \"MQTT_UID\" variable is not set. Defaulting to a blank string."
+```
+
+`user:` 가 비면 컨테이너가 **root 로 뜨고**, `data/` 에 root 소유 파일이 생겨 이후 `docker` 사용자가 백업도 삭제도 할 수 없게 된다. 경고 한 줄은 기동 출력에 묻히기 쉽다.
+
+바꿔야 할 값은 두 개다:
 
 ```bash
 cd /sw/docker/mqtt
-printf 'MQTT_UID=%s\nMQTT_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
-chmod 600 .env
-cat .env
+id -u; id -g                                    # user: 에 적을 값
+vi docker-compose.yml
 ```
 
-기대 출력:
+| YAML 위치 | 채울 값 |
+|---|---|
+| `user: "1001:1001"` | `id -u` 와 `id -g` 결과 |
+| healthcheck 의 `"<health 비밀번호>"` | §5.8 (1) 에서 확인한 값 |
+
+`image:` 의 레지스트리 경로도 환경에 맞게 확인한다(§3).
+
+#### 권한
+
+**비밀번호가 들어 있으므로 `600` 으로 잠근다.**
+
+```bash
+chmod 600 /sw/docker/mqtt/docker-compose.yml
+ls -l /sw/docker/mqtt/docker-compose.yml
 ```
-MQTT_HEALTH_PW=...
-MQTT_UID=1001
-MQTT_GID=1001
-```
 
-compose 가 같은 디렉터리의 `.env` 를 자동으로 읽어 `user:` 와 healthcheck 에 채운다.
+기대: `-rw------- 1 docker docker`
 
-> ⚠️ **`MQTT_UID`/`MQTT_GID` 가 비어 있으면 컨테이너가 root 로 뜬다.** 그러면 `data/` 에 root 소유 파일이 생겨 이후 `docker` 사용자가 백업·삭제할 수 없게 된다. 기동 후 §6.3 에서 반드시 확인한다.
-
-> 이 값은 compose 파싱 시점에 컨테이너 설정에 박혀 **`docker inspect`로 평문 노출된다.** 숨기려 애쓰는 대신 **노출돼도 아무것도 못 하는 계정**을 쓴다 — `health` 는 `$SYS/broker/uptime` 읽기 권한 하나뿐이다(§4.2 ACL).
+> `$$SYS` 의 `$$` 는 그대로 두어야 한다. 치환을 쓰지 않더라도 compose 는 `$` 를 특수문자로 취급하므로, `$$` 로 적어야 컨테이너에 `$SYS` 로 전달된다.
 
 ### 6.3 기동
 
@@ -869,6 +889,7 @@ mosquitto version 2.0.22 running
 ```bash
 docker inspect mqtt-broker --format 'User={{.Config.User}}'
 docker inspect mqtt-broker --format 'Log={{.HostConfig.LogConfig.Config}}'
+docker inspect mqtt-broker --format 'Mem={{.HostConfig.Memory}}'
 ls -l /sw/docker/mqtt/data/
 ```
 
@@ -876,6 +897,7 @@ ls -l /sw/docker/mqtt/data/
 ```
 User=1001:1001                      ← 비어 있으면 root 로 뜬 것이다 (§6.2)
 Log=map[max-file:5 max-size:50m]    ← map[] 이면 미적용 (§2.3)
+Mem=2147483648                      ← 2G. 0 이면 미적용
 ```
 
 `data/` 는 기동 직후에는 비어 있는 것이 정상이다. `mosquitto.db` 는 `autosave_interval`(30초) 경과 또는 정지 시점에 기록된다. 생성 후 소유자를 확인한다:
@@ -885,7 +907,7 @@ ls -l /sw/docker/mqtt/data/
 # -rw------- 1 docker docker ... mosquitto.db
 ```
 
-`root` 소유로 생겼다면 `.env` 의 UID/GID 가 비어 있었던 것이다. 컨테이너를 내리고(`docker compose down`) **root 소유 파일 삭제를 인프라 담당에 요청한 뒤** §6.2 부터 다시 한다.
+`root` 소유로 생겼다면 compose 의 `user:` 가 비었거나 빠진 것이다. 컨테이너를 내리고(`docker compose down`) **root 소유 파일 삭제를 인프라 담당에 요청한 뒤** §6.2 부터 다시 한다.
 
 **설정 파일은 compose에 파일명으로 나타나지 않는다.** 디렉터리를 통째로 마운트하고(`/sw/docker/mqtt/config:/mosquitto/config:ro`), 이미지 기본 CMD가 `mosquitto -c /mosquitto/config/mosquitto.conf`이기 때문에 경로가 맞물려 적용된다. `Config loaded from ...` 로그로 확인한다.
 
@@ -1363,7 +1385,7 @@ docker kill -s HUP mqtt-broker        # 대부분의 설정. 접속 유지
 | `persistent_client_expiration` | **SIGHUP** |
 | **`listener` 추가·삭제** | **재시작** |
 | **리스너의 TLS 인증서 경로** | **재시작** |
-| **compose 의 `user:`, `logging:`, `ports:`** | **`docker compose up -d`** (컨테이너 재생성) |
+| **`docker-compose.yml` 자체** (`user:`, `logging:`, `ports:`) | **`docker compose up -d`** (컨테이너 재생성) |
 
 리스너를 바꾸고 SIGHUP 을 보내면 조용히 무시되지 않고 다음 오류가 남는다:
 
@@ -1412,7 +1434,7 @@ cp -p mosquitto.conf mosquitto.conf.$(date +%F)
 | 명령이 간헐적으로 유실 | 방화벽 idle timeout | §7.8. half-open. idle timeout 상향 |
 | 접속은 되는데 명령이 안 옴 | ACL 위반 (SUBACK은 정상) | §7.3. 전달 시점 차단이라 구독은 성공해 보인다 |
 | 재시작 후 명령이 조용히 사라짐 | `data/` 유실 → 세션 없음 | §8.4 복원 |
-| `data/` 에 root 소유 파일 | `.env` 의 `MQTT_UID`/`MQTT_GID` 누락 → 컨테이너가 root 로 뜸 | §6.2. 재생성 후 root 파일 삭제는 인프라 담당 요청 |
+| `data/` 에 root 소유 파일 | compose 의 `user:` 누락 → 컨테이너가 root 로 뜸 | §6.2. 재생성 후 root 파일 삭제는 인프라 담당 요청 |
 | 두 Agent 가 무한 재접속 | clientId 충돌 (session takeover) | 한 호스트·한 계정으로 Agent 를 두 개 띄운 경우. agentId 가 겹친다 (§5.1) |
 | 브로커 호스트 디스크 고갈 | Agent 재접속 반복 → 접속 로그 누적 | §2.3 로테이션. 근본 원인은 §7.8(idle timeout) 또는 clientId 충돌 |
 | 설정 파일이 `Permission denied` | 소유자가 `docker` 가 아님 | `ls -l` 확인. root 소유면 인프라 담당에 소유권 이전 요청 (§8.7) |
