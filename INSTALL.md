@@ -241,7 +241,35 @@ chown: /mosquitto/config/passwd: Read-only file system
 
 ### 2.3 로그 로테이션
 
-브로커가 오래 죽어 있으면 Agent 300대가 재접속 실패 로그를 쏟아내 **디스크가 찬다.** Agent 한 대가 재접속 실패 시 스택트레이스를 포함해 수백 바이트를 남기므로, 300대 × 재시도 주기로 빠르게 누적된다. 컨테이너별 설정은 §6.1 `logging:` 블록에 있고, 여기서는 데몬 기본값을 잡는다.
+Docker 의 `json-file` 드라이버는 **기본적으로 로테이션을 하지 않는다.** 컨테이너를 지우기 전까지 `/var/lib/docker/containers/<id>/<id>-json.log` 가 무한정 커진다. 설정 여부는 이렇게 확인한다:
+
+```bash
+docker info --format '{{.LoggingDriver}}'
+docker inspect <컨테이너> --format '{{.HostConfig.LogConfig.Config}}'   # map[] 이면 무제한
+```
+
+#### 무엇이 로그를 채우는가
+
+**정상 운영 중에는 거의 늘지 않는다.** `connection_messages true` 는 접속/해제 시에만 기록하므로, 300대가 붙어서 유지되는 동안에는 추가 로그가 없다. 문제는 **Agent 가 재접속을 반복하는 상황**이다. 접속 1회당 브로커가 남기는 로그는 실측 기준 약 300~550 bytes 다:
+
+```
+New connection from 10.x.y.21:33200 on port 1883.
+New client connected from 10.x.y.21:33200 as myhost01_wasadm_J (p2, c1, k30, u'myhost01_wasadm_J').
+Client myhost01_wasadm_J disconnected.
+```
+
+| 상황 | 브로커 호스트 하루 로그량 |
+|---|---|
+| 정상 — 300대 접속 유지 | 최초 ~100 KB, 이후 거의 증가 없음 |
+| **방화벽 idle timeout** — 45초마다 재접속(§7.8) | **~150 MB/일** |
+| **clientId 충돌** — 초당 재접속 루프(§9) | **~7 GB/일** |
+| **브로커 기동 실패 반복** — `restart: unless-stopped` 로 재시작 루프 | 기동 배너가 매회 누적 |
+
+> ⚠️ **브로커가 꺼져 있는 동안에는 브로커 로그가 늘지 않는다.** 그때 재접속 실패 로그를 쏟아내는 것은 Agent 300대이고, 그것은 **각 Agent 호스트의 디스크**다. 이 절의 설정으로는 막을 수 없으며, Agent 측 로깅 정책으로 따로 다뤄야 한다.
+
+위험한 쪽은 **브로커가 살아 있는데 Agent 가 붙었다 끊기를 반복하는** 경우다. 둘 다 발견이 늦는 장애라 주말을 끼면 그대로 쌓인다. 차는 곳이 `/var/lib/docker` 라 브로커뿐 아니라 **호스트의 다른 컨테이너까지 영향을 받는다.**
+
+컨테이너별 설정은 §6.1 `logging:` 블록에 있고, 여기서는 데몬 기본값을 잡는다.
 
 ```bash
 sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak 2>/dev/null || true
@@ -261,6 +289,9 @@ sudo systemctl restart docker
 ```bash
 docker info --format '{{.LoggingDriver}}'      # json-file
 ```
+
+> **데몬 설정이 부담스러우면 이 절을 건너뛰어도 된다.** §6.1 compose 파일의 `logging:` 블록만으로 브로커 컨테이너는 최대 250 MB 로 묶인다(`max-size 50m` × `max-file 5`). 데몬 재시작도 필요 없다.
+> 차이는 **호스트의 다른 컨테이너까지 보호할지** 여부다. 이 호스트에서 브로커만 돌린다면 §6.1 만으로 충분하다.
 
 ---
 
@@ -1231,7 +1262,7 @@ sudo ls -lh /sw/docker/mqtt/data/mosquitto.db        # 큐 크기 추이
 | 접속은 되는데 명령이 안 옴 | ACL 위반 (SUBACK은 정상) | §7.3. 전달 시점 차단이라 구독은 성공해 보인다 |
 | 재시작 후 명령이 조용히 사라짐 | `data/` 유실 → 세션 없음 | §8.4 복원 |
 | 두 Agent 가 무한 재접속 | clientId 충돌 (session takeover) | 한 호스트·한 계정으로 Agent 를 두 개 띄운 경우. agentId 가 겹친다 (§5.1) |
-| 디스크 고갈 | 브로커 장기 다운 → 로그 폭증 | §2.3 로테이션 확인 |
+| 브로커 호스트 디스크 고갈 | Agent 재접속 반복 → 접속 로그 누적 | §2.3 로테이션. 근본 원인은 §7.8(idle timeout) 또는 clientId 충돌 |
 | 미상 프로토콜로 차단 | IPS/DPI 오탐 | §1.1. 평문이라 DPI 가 페이로드를 본다. 예외 등록 요청 |
 | 오프라인 Agent 에 명령이 안 쌓임 | **구독 QoS 가 0** | 구독에 `-q 1`. QoS 0 은 큐잉 대상이 아니다 (§7.5) |
 | 발행이 성공하는데 아무도 못 받음 | ACL 거부인데 MQTT 3.1.1 로 확인 | `-V 5` 로 PUBACK 사유 코드 확인. `RC:135` = 거부 (§7.4) |
