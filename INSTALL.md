@@ -1,7 +1,7 @@
 # MQTT 브로커 운영 설치 가이드
 
 대상: **Docker Compose 단일 노드 / 폐쇄망 / Agent 300대 / 평문 1883**
-설계 근거는 `DESIGN.md`. 이 문서는 "그대로 따라 하면 되는" 절차만 담는다.
+이 문서만으로 설치가 끝나도록 썼다. 각 절 머리에 **실행 위치**가 있고, 명령마다 **기대 출력**을 함께 적었다.
 
 ---
 
@@ -14,7 +14,7 @@
 | 리스너 | **평문 1883 단일** (TLS 미사용 — §0.1) |
 | 인증 | `password_file` + ACL |
 | 실행 | Docker Compose, 단일 노드 (Swarm 미사용) |
-| 인스턴스 | **1개.** Mosquitto는 클러스터링이 없다 (§10, §16.6) |
+| 인스턴스 | **1개.** Mosquitto 는 클러스터링을 지원하지 않는다 |
 | 네트워크 | 인터넷 불가 폐쇄망 |
 
 ### 0.1 TLS 미적용에 따른 전제
@@ -30,11 +30,11 @@
 | 완화책 | 위치 |
 |---|---|
 | 브로커를 Agent 대역과 중앙서버에서만 접근 가능하게 제한 | §1.1 방화벽 |
-| Agent별 계정 분리 — 하나가 새도 그 Agent 하나만 위험 | §5 |
-| `central` 자격증명을 가장 엄격히 관리 (300대 전체 명령 권한) | §5.4 |
-| 헬스체크 계정을 무력화 — 노출돼도 할 수 있는 게 없음 | §4.2 |
+| Agent 별 계정 분리 — 하나가 새도 그 Agent 하나만 위험 | §5.1 |
+| `central` 자격증명을 가장 엄격히 관리 (300대 전체 명령 권한) | §5.8 |
+| 헬스체크 계정을 무력화 — 노출돼도 할 수 있는 게 없음 | §4.2, §6.2 |
 
-나중에 TLS를 켜려면 `DESIGN.md` §15.4(사내 CA, SAN에 FQDN+IP)를 따른다. 8883 리스너를 추가하고 전환 기간에 두 포트를 함께 열면 무중단으로 넘어갈 수 있다.
+나중에 TLS 를 켜는 절차는 **부록 A** 에 있다. 8883 리스너를 추가하고 전환 기간에 두 포트를 함께 열면 무중단으로 넘어갈 수 있다.
 
 ### 0.2 소요 시간
 
@@ -46,11 +46,111 @@
 
 ---
 
+### 0.3 설치 디렉터리 구조
+
+모든 파일은 **`/srv/mqtt`** 아래에 둔다. 이 문서의 경로는 전부 절대경로이며, 각 절 머리에 **실행 위치**를 명시한다.
+
+```
+/srv/mqtt/                      ← 설치 루트
+├── docker-compose.yml          §6.1   root:root    644
+├── .env                        §6.2   root:root    600   ← health 비밀번호
+├── config/                     §2.1   1883:1883    700
+│   ├── mosquitto.conf          §4.1   1883:1883    600
+│   ├── acl                     §4.2   1883:1883    600
+│   └── passwd                  §5.7   1883:1883    600   ← 해시 목록
+├── data/                       §2.1   1883:1883    700   ← 세션·오프라인 큐. 백업 대상
+│   └── mosquitto.db                   컨테이너가 생성한다
+└── log/                        §2.1   1883:1883    700
+```
+
+설치 중에만 존재하는 작업 디렉터리 — **메모리 파일시스템이며 §5.9 에서 파기한다**:
+
+```
+/dev/shm/mqtt-prov/             §5.2   현재 사용자   700
+├── inventory.csv                      호스트/계정 목록
+├── gen-accounts.sh                    계정 생성 스크립트
+├── passwd                             생성 결과(해시) → /srv/mqtt/config/ 로 이동
+└── creds.csv                          ★ 평문 비밀번호. 배포 후 shred
+```
+
+컨테이너 안에서의 대응 경로(§6.1 볼륨 마운트):
+
+| 호스트 | 컨테이너 | 모드 |
+|---|---|---|
+| `/srv/mqtt/config` | `/mosquitto/config` | **읽기 전용** |
+| `/srv/mqtt/data` | `/mosquitto/data` | 쓰기 |
+| `/srv/mqtt/log` | `/mosquitto/log` | 쓰기 |
+
+> 로그에 나오는 `/mosquitto/config/...` 는 **컨테이너 안 경로**다. 호스트에서 고칠 때는 `/srv/mqtt/config/...` 로 바꿔 읽는다.
+
+uid/gid **1883** 은 컨테이너 안 `mosquitto` 계정 번호다. **호스트에는 이 계정이 없는 것이 정상이며**, bind mount 는 uid 를 번역하지 않고 숫자만 비교하므로 호스트 파일의 소유자를 1883 으로 맞춰야 한다. `ls -l` 에 이름 대신 숫자가 보이는 것이 정상이다.
+
+---
+
+
+### 0.4 실행 위치 표기 — 호스트 작업과 컨테이너 작업 구분
+
+**결론부터: 이 가이드의 작업은 거의 전부 리눅스 호스트에서 한다.** 컨테이너 셸에 들어가는 작업은 §9 의 점검 명령 하나뿐이다.
+
+각 절 머리에 아래 세 가지 중 하나를 표시한다.
+
+| 표기 | 의미 | 프롬프트가 있는 곳 |
+|---|---|---|
+| **[호스트]** | 리눅스 호스트 셸에서 직접 실행 | 브로커 호스트 |
+| **[호스트 → 일회용 컨테이너]** | 호스트 파일을 다루되, **도구를 이미지에서 빌려 쓴다** | 브로커 호스트 |
+| **[컨테이너 내부]** | 돌고 있는 브로커 컨테이너 안에서 실행 | 컨테이너 |
+
+#### 가장 헷갈리는 것 — "일회용 컨테이너"는 컨테이너 작업이 아니다
+
+계정 생성(§5)과 갱신(§8.1)에 이런 명령이 나온다.
+
+```bash
+docker run --rm --user 1883:1883 -v /srv/mqtt/config:/w <이미지> \
+  mosquitto_passwd -b /w/passwd 'myhost01_wasadm_J' '<pw>'
+```
+
+`docker run` 이 보이니 컨테이너 작업처럼 읽히지만, **실제로 바뀌는 것은 호스트의 `/srv/mqtt/config/passwd` 파일**이다. 컨테이너는 `mosquitto_passwd` 라는 바이너리를 꺼내 쓰기 위해 1초 떴다가 사라진다(`--rm`). 호스트에 mosquitto 를 설치하지 않으려는 것뿐이다.
+
+- 돌고 있는 브로커는 **건드리지 않는다.** `mosquitto_passwd` 는 브로커 데몬과 별개의 CLI 이므로 브로커가 꺼져 있어도 동작한다.
+- `-v /srv/mqtt/config:/w` 가 호스트 디렉터리를 컨테이너의 `/w` 로 연결한다. 그래서 명령 안의 경로는 `/w/passwd` 지만 **결과는 호스트 `/srv/mqtt/config/passwd`** 에 남는다.
+
+#### 경로 읽는 법
+
+같은 파일이 호스트와 컨테이너에서 다른 경로로 불린다. **로그는 컨테이너 경로로 찍힌다.**
+
+| 로그·설정에 보이는 경로 | 호스트에서 고칠 경로 |
+|---|---|
+| `/mosquitto/config/mosquitto.conf` | `/srv/mqtt/config/mosquitto.conf` |
+| `/mosquitto/config/passwd` | `/srv/mqtt/config/passwd` |
+| `/mosquitto/config/acl` | `/srv/mqtt/config/acl` |
+| `/mosquitto/data/mosquitto.db` | `/srv/mqtt/data/mosquitto.db` |
+
+`mosquitto.conf` 안의 `password_file /mosquitto/config/passwd` 도 **컨테이너 기준 경로**다. 호스트 경로로 바꿔 쓰면 브로커가 파일을 찾지 못한다.
+
+#### 장별 실행 위치 요약
+
+| 장 | 실행 위치 | 작업 디렉터리 |
+|---|---|---|
+| §1 방화벽 신청 | 실행 명령 없음 (결재 문서) | — |
+| §2 호스트 준비 | **[호스트]** | `/srv/mqtt`, `/etc/docker` |
+| §3 이미지 반입 | **[호스트]** 인터넷 구간 + 폐쇄망 호스트 | 임의 (예: `~/`) |
+| §4 설정 파일 | **[호스트]** | `/srv/mqtt/config` |
+| §5 계정 생성 | **[호스트]** + **[호스트 → 일회용 컨테이너]** | `/dev/shm/mqtt-prov` → `/srv/mqtt/config` |
+| §6 배포 | **[호스트]** | `/srv/mqtt` |
+| §7 설치 검증 | **[운영자 단말]·[Agent 호스트]** — 브로커 **밖**에서 | 임의 |
+| §8 운영 절차 | **[호스트]** + **[호스트 → 일회용 컨테이너]** | `/srv/mqtt` |
+| §9 트러블슈팅 | **[호스트]** (점검 명령 1개만 **[컨테이너 내부]**) | `/srv/mqtt` |
+
+---
+
+
 ## 1. 선행 작업
+
+> **실행 위치: 없음.** 방화벽 신청서 작성·접수만 하는 장이다. 리드타임이 길어 가장 먼저 착수한다.
 
 ### 1.1 방화벽 신청
 
-`DESIGN.md` §15.2 기준. **포트를 8883이 아닌 1883으로** 신청한다. 출발지는 개별 IP 300개가 아니라 **대역(CIDR)**으로 낸다.
+**포트를 8883 이 아닌 1883 으로** 신청한다. 출발지는 개별 IP 300개가 아니라 **대역(CIDR)**으로 낸다.
 
 | # | 출발지 | 목적지 | 포트 | 용도 |
 |---|---|---|---|---|
@@ -72,13 +172,13 @@
 - 방화벽 TCP idle timeout 을 60초 이상으로 설정 요청드립니다. (권장 3600초)
 ```
 
-> **idle timeout이 이 설치의 최대 사고 요인이다.** 값이 짧으면 양쪽 다 끊긴 줄 모르는 half-open 상태가 되어, 서버는 정상 publish + PUBACK을 받지만 Agent에는 영영 도달하지 않는다 (§15.3-a).
+> **idle timeout이 이 설치의 최대 사고 요인이다.** 값이 짧으면 양쪽 다 끊긴 줄 모르는 half-open 상태가 되어, 서버는 정상 publish + PUBACK을 받지만 Agent에는 영영 도달하지 않는다.
 
 체크리스트:
 - [ ] 6개 항목 접수, Agent 대역 CIDR 확정
 - [ ] idle timeout ≥ 60초 확인 (권장 3600)
 - [ ] NAT 경유 시 세션 테이블 여유 확인 — 상시 300세션이 **회수되지 않고** 점유된다
-- [ ] IPS/DPI 애플리케이션 검사 여부 확인 — MQTT 시그니처가 없는 장비는 미상 프로토콜로 차단할 수 있다 (§15.3-c). **TLS가 없으므로 DPI가 페이로드를 그대로 본다**
+- [ ] IPS/DPI 애플리케이션 검사 여부 확인 — MQTT 시그니처가 없는 장비는 미상 프로토콜로 차단할 수 있다. **TLS 가 없으므로 DPI가 페이로드를 그대로 본다**
 
 ### 1.2 이미지 반입 경로
 
@@ -88,53 +188,92 @@
 
 ## 2. 호스트 준비
 
-### 2.1 디렉터리
+> **[호스트] 작업 디렉터리: `/srv/mqtt`, `/etc/docker`**
+> 이 시점에는 컨테이너가 **아직 존재하지 않는다**(기동은 §6). 들어갈 컨테이너가 없으므로 전부 호스트 작업이다.
+> 나중에도 설정 디렉터리는 읽기 전용으로 마운트하므로, 권한은 **항상 호스트에서** 잡는다.
+
+### 2.1 디렉터리 생성
 
 ```bash
-sudo mkdir -p /srv/mqtt/{config,data,log}
+sudo mkdir -p /srv/mqtt/config /srv/mqtt/data /srv/mqtt/log
 ```
 
-### 2.2 권한 — 건너뛰면 브로커가 안 뜬다
-
-컨테이너 내부 mosquitto는 **uid/gid 1883**으로 동작한다.
+### 2.2 소유자와 권한
 
 ```bash
 sudo chown -R 1883:1883 /srv/mqtt
-sudo chmod 700 /srv/mqtt/config
+sudo chmod 700 /srv/mqtt/config /srv/mqtt/data /srv/mqtt/log
 ```
 
-mosquitto 2.0은 `passwd`·`acl`이 world-readable이거나 소유자가 다르면 경고한다:
+확인:
+```bash
+ls -ld /srv/mqtt /srv/mqtt/config /srv/mqtt/data /srv/mqtt/log
+```
+
+기대 출력 — **소유자가 이름이 아닌 숫자 `1883` 으로 보이는 것이 정상**이다:
+```
+drwxr-xr-x 5 1883 1883 4096 ... /srv/mqtt
+drwx------ 2 1883 1883 4096 ... /srv/mqtt/config
+drwx------ 2 1883 1883 4096 ... /srv/mqtt/data
+drwx------ 2 1883 1883 4096 ... /srv/mqtt/log
+```
+
+#### 왜 이 단계를 건너뛰면 안 되는가
+
+mosquitto 2.0 은 `passwd`·`acl` 이 world-readable 이거나 소유자가 다르면 다음을 출력한다:
 
 ```
 Warning: File /mosquitto/config/acl has world readable permissions.
          Future versions will refuse to load this file.
+Warning: File /mosquitto/config/acl owner is not mosquitto.
+         Future versions will refuse to load this file.
 ```
 
-**"Future versions will refuse to load"는 예고다.** 폐쇄망에서 브로커가 안 뜨는 상황은 복구가 번거로우니 처음부터 맞춘다. 설정 디렉터리를 `:ro`로 마운트하면 컨테이너 entrypoint의 `chown`이 실패하므로 **반드시 호스트에서** 잡는다.
+**"Future versions will refuse to load" 는 경고가 아니라 예고다.** 상위 버전으로 올리는 순간 브로커가 뜨지 않는다. 폐쇄망에서는 복구가 번거로우니 처음부터 맞춘다.
+
+컨테이너 entrypoint 가 기동 시 `chown` 을 시도하지만, `:ro` 마운트라 실패한다:
+```
+chown: /mosquitto/config/passwd: Read-only file system
+```
+`:ro` 를 떼면 컨테이너가 고칠 수 있으나, **브로커가 자기 인증 설정을 덮어쓸 수 있게** 되므로 읽기 전용을 유지한다.
 
 ### 2.3 로그 로테이션
 
-브로커가 오래 죽어 있으면 Agent 300대가 재접속 실패 로그를 쏟아내 **디스크가 찬다** (§16.7). Compose 파일의 `logging:` 블록(§6.1)으로 처리하며, 데몬 기본값도 함께 잡아두면 안전하다.
+브로커가 오래 죽어 있으면 Agent 300대가 재접속 실패 로그를 쏟아내 **디스크가 찬다.** Agent 한 대가 재접속 실패 시 스택트레이스를 포함해 수백 바이트를 남기므로, 300대 × 재시도 주기로 빠르게 누적된다. 컨테이너별 설정은 §6.1 `logging:` 블록에 있고, 여기서는 데몬 기본값을 잡는다.
 
-`/etc/docker/daemon.json`:
-```json
+```bash
+sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak 2>/dev/null || true
+sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
 {
   "log-driver": "json-file",
   "log-opts": { "max-size": "50m", "max-file": "5" }
 }
+JSON
+sudo systemctl restart docker
 ```
+
+> ⚠️ `daemon.json` 이 이미 있으면 **덮어쓰지 말고 키만 병합**한다. 위 명령은 백업을 남기지만, 다른 설정(레지스트리 미러 등)이 있었다면 복원해 합쳐야 한다.
+> ⚠️ `systemctl restart docker` 는 **이 호스트의 모든 컨테이너를 재시작한다.** 브로커 설치 전에 수행하는 이유다.
+
+확인:
 ```bash
-sudo systemctl restart docker      # 기존 컨테이너 재시작됨. 설치 전에 수행
+docker info --format '{{.LoggingDriver}}'      # json-file
 ```
 
 ---
 
+
 ## 3. 이미지 반입
+
+> **[호스트] 작업 디렉터리: 임의 (예: `~/`)**
+> 앞부분은 **인터넷 가능 구간**, 뒷부분은 **폐쇄망 브로커 호스트**에서 실행한다. 각 블록에 표시했다.
+
 
 ### 3.1 사내 레지스트리
 
+**[호스트 — 인터넷 가능 구간]**
+
 ```bash
-# 인터넷 가능 구간
 docker pull eclipse-mosquitto:2.0
 docker tag  eclipse-mosquitto:2.0 registry.corp.local/mqtt/eclipse-mosquitto:2.0.22
 docker push registry.corp.local/mqtt/eclipse-mosquitto:2.0.22
@@ -142,18 +281,25 @@ docker push registry.corp.local/mqtt/eclipse-mosquitto:2.0.22
 
 ### 3.2 tar 반입
 
+**[호스트 — 인터넷 가능 구간]**
+
 ```bash
-# 인터넷 가능 구간
 docker pull eclipse-mosquitto:2.0
 docker save eclipse-mosquitto:2.0 -o mosquitto-2.0.22.tar     # ~10 MB
 sha256sum mosquitto-2.0.22.tar > mosquitto-2.0.22.sha256
 
-# 폐쇄망
+```
+
+**[호스트 — 폐쇄망 브로커 호스트]**
+
+```bash
 sha256sum -c mosquitto-2.0.22.sha256
 docker load -i mosquitto-2.0.22.tar
 ```
 
 ### 3.3 검증
+
+**[호스트 — 폐쇄망 브로커 호스트]**
 
 ```bash
 docker run --rm --entrypoint mosquitto <이미지> -h | head -3
@@ -166,11 +312,24 @@ docker run --rm --entrypoint mosquitto <이미지> -h | head -3
 
 ## 4. 설정 파일
 
-저장소의 `broker/config/` 내용과 동일하다. 운영 경로로 배치한다.
+> **[호스트] 작업 디렉터리: `/srv/mqtt/config`**
+> 파일을 호스트에 만든다. 컨테이너는 아직 없다.
+> 파일 안에 적는 `/mosquitto/config/...` 경로는 **컨테이너 기준 경로**다(§0.4). 호스트 경로로 바꿔 쓰면 브로커가 파일을 찾지 못한다.
 
-### 4.1 `/srv/mqtt/config/mosquitto.conf`
+만들 파일은 두 개다. `passwd` 는 §5 에서 생성한다.
 
-```conf
+```
+/srv/mqtt/config/mosquitto.conf     ← §4.1
+/srv/mqtt/config/acl                ← §4.2
+/srv/mqtt/config/passwd             ← §5.7 에서 설치
+```
+
+### 4.1 `mosquitto.conf` 생성
+
+아래 블록을 **통째로** 붙여넣는다.
+
+```bash
+sudo tee /srv/mqtt/config/mosquitto.conf >/dev/null <<'CONF'
 listener 1883
 protocol mqtt
 
@@ -186,7 +345,7 @@ autosave_interval 30
 # 오프라인 Agent 세션 보존 기간. 명령 만료(1h)보다 충분히 길게
 persistent_client_expiration 7d
 
-# 세션당 큐 상한 — 명령은 1h 에 자동 소멸한다 (§12.5)
+# 세션당 큐 상한 — 명령은 1h 에 자동 소멸하므로 1000건을 쌓을 이유가 없다
 max_queued_messages 100
 max_inflight_messages 20
 memory_limit 512MB
@@ -197,13 +356,33 @@ log_type warning
 log_type notice
 log_type information
 connection_messages true
+CONF
 ```
 
-> **MQTT 5 관련 설정은 없다.** mosquitto 2.0은 3.1.1과 5.0을 같은 리스너에서 동시에 받고, `Message Expiry Interval` 처리는 기본 동작이다. 프로토콜 버전은 클라이언트가 결정한다 (Python `protocol=mqtt.MQTTv5`, Java `org.eclipse.paho.mqttv5.client`).
+권한 적용:
 
-### 4.2 `/srv/mqtt/config/acl`
-
+```bash
+sudo chown 1883:1883 /srv/mqtt/config/mosquitto.conf
+sudo chmod 600 /srv/mqtt/config/mosquitto.conf
 ```
+
+주요 값의 의미:
+
+| 설정 | 의미 |
+|---|---|
+| `allow_anonymous false` | 익명 접속 차단. `password_file` 인증 강제 |
+| `persistence true` | 컨테이너 재시작에도 세션·오프라인 큐 유지 |
+| `persistent_client_expiration 7d` | 오프라인 Agent 세션 보존 기간. 명령 만료(1h)보다 길어야 한다 |
+| `max_queued_messages 100` | 세션당 큐 상한. 명령이 1h 에 소멸하므로 충분하다 |
+| `memory_limit 512MB` | 큐 폭주 시 브로커 자체를 보호 |
+| `connection_messages true` | 접속/해제 로그. 장애 추적에 필요하다 |
+
+> **MQTT 5 관련 설정은 없다.** mosquitto 2.0 은 3.1.1 과 5.0 을 같은 리스너에서 동시에 받고, `Message Expiry Interval` 처리는 기본 동작이다. 프로토콜 버전은 클라이언트가 CONNECT 시점에 결정한다(Python `protocol=mqtt.MQTTv5`, Java `org.eclipse.paho.mqttv5.client`).
+
+### 4.2 `acl` 생성
+
+```bash
+sudo tee /srv/mqtt/config/acl >/dev/null <<'ACL'
 # 컨트롤러: 명령 발행 전용. 읽기 권한 없음
 user central
 topic write cmd/#
@@ -212,105 +391,342 @@ topic write cmd/#
 user ops
 topic read  $SYS/#
 
-# 헬스체크 전용 — 토픽 하나. 노출돼도 할 수 있는 게 없다 (§5.1)
+# 헬스체크 전용 — 토픽 하나. 노출돼도 할 수 있는 게 없다
 user health
 topic read  $SYS/broker/uptime
 
 # Agent 공통 패턴 — %u 는 접속 username 으로 치환
 pattern read  cmd/%u/req
 pattern read  cmd/broadcast/req
+ACL
 ```
 
-`central`에 읽기 권한이 없고 Agent에 쓰기 권한이 없다. **발행 전용 / 구독 전용 설계가 ACL 레벨에서 강제된다.**
+권한 적용:
 
-기동 시 다음 경고가 뜨는데 **정상이다.** `pattern` 행에 치환 문자가 없어서 나며, 모든 인증 사용자에게 적용된다 (§5.2, 실측 확인):
+```bash
+sudo chown 1883:1883 /srv/mqtt/config/acl
+sudo chmod 600 /srv/mqtt/config/acl
+```
+
+> ⚠️ **`sudo tee` 로 만든 파일은 `root:root 644` 가 된다.** 위 `chown`/`chmod` 를 빼먹으면 §6 기동 시 `world readable permissions` 경고가 뜨고, mosquitto 상위 버전에서는 브로커가 아예 뜨지 않는다.
+
+이 ACL 이 강제하는 것:
+
+- `central` 에 **읽기 권한이 없다** → 중앙서버는 발행만 할 수 있다. 실수로 구독 코드가 들어가도 브로커가 거부한다.
+- Agent 계정에 **쓰기 권한이 없다** → Agent 는 구독만 할 수 있다. 실수로 발행 코드가 들어가도 거부된다.
+- `pattern read cmd/%u/req` 의 `%u` 가 접속 username 으로 치환되므로, **`myhost01_wasadm_J` 는 `myhost02_wasadm_J` 의 명령 토픽을 구독할 수 없다.** §5 에서 계정명을 agentId 와 일치시켜야 하는 이유다.
+
+기동 시 다음 경고가 뜨는데 **정상이다.** `pattern` 행에 치환 문자가 없어서 나며, **모든 인증 사용자에게 적용되는 규칙으로 정상 동작한다**(실측 확인):
 
 ```
 Warning: ACL pattern 'cmd/broadcast/req' does not contain '%c' or '%u'.
 ```
 
+### 4.3 배치 확인
+
+```bash
+sudo ls -l /srv/mqtt/config/
+```
+
+기대 출력 — **소유자가 숫자 `1883`, 권한 `-rw-------`**:
+```
+-rw------- 1 1883 1883  426 ... acl
+-rw------- 1 1883 1883  692 ... mosquitto.conf
+```
+
+`passwd` 는 아직 없다. §5 에서 만든다.
+
 ---
+
 
 ## 5. 계정 생성
 
-### 5.1 username = agentId
+> **[호스트] 작업 디렉터리: `/dev/shm/mqtt-prov` → 결과를 `/srv/mqtt/config` 로 설치**
+> §2 에서 디렉터리를 만든 **브로커 호스트**에서 한다. 이유는 두 가지다. ① 생성 결과 `passwd` 를 `/srv/mqtt/config/` 에 바로 넣어야 한다. ② 평문 비밀번호 목록이 네트워크를 타지 않는다.
+>
+> 계정 생성 명령(§5.4~§5.5)은 **[호스트 → 일회용 컨테이너]** 다. `docker run` 이 보이지만 컨테이너에 들어가는 것이 아니라, 이미지에서 `mosquitto_passwd` 만 빌려 호스트 파일을 만드는 것이다(§0.4).
 
-ACL이 `%u` 치환에 의존하므로 **계정명은 agentId와 정확히 일치해야 한다.** agentId는 Agent가 스스로 만들지 않고 다음 규칙으로 조립된다 (§2.1):
-
-```
-agentId = ${HOSTNAME}_${USER}_J        # 예: myhost01_wasadm_J
-```
-
-> ⚠️ `DESIGN.md` §5.1의 일괄 생성 예시는 `agent-001` 형식인데, §2.1 개정 전의 잔재다. **운영에서는 실제 agentId를 쓴다.** `agent-001`로 만들면 Agent가 `myhost01_wasadm_J`로 접속해 인증에 실패한다.
-
-**Agent별 계정 분리는 타협 불가다.** 계정을 공유하면 `pattern read cmd/%u/req`가 모두 같은 토픽으로 풀려 아무 Agent나 남의 명령을 구독할 수 있다 (§5.1). 평문 구간에서는 이 분리가 더 중요하다 — 자격증명 하나가 새도 피해가 그 Agent 하나로 묶인다.
-
-### 5.2 인벤토리
+### 5.0 사전 확인
 
 ```bash
-# /dev/shm/inventory.csv  — hostname,user
+docker --version          # Docker 20.10 이상
+openssl version           # 비밀번호 생성에 사용
+sudo -v                   # sudo 권한 확인 (암호 물어보면 입력)
+ls -ld /srv/mqtt/config   # §2 에서 만든 디렉터리
+```
+
+마지막 명령의 기대 출력:
+```
+drwx------ 2 1883 1883 4096 ... /srv/mqtt/config
+```
+
+`No such file or directory` 가 나오면 §2 를 먼저 수행한다.
+
+### 5.1 무엇을 만드는가
+
+총 **303개** 계정을 만든다.
+
+| 계정 | 개수 | ACL 권한 | 받는 쪽 |
+|---|---|---|---|
+| `central` | 1 | `topic write cmd/#` — 300대 전체 명령 권한 | Python 중앙서버 |
+| `health` | 1 | `$SYS/broker/uptime` 읽기만 | 브로커 호스트 `.env` |
+| `ops` | 1 | `$SYS/#` 읽기 | 운영자 단말 |
+| Agent | 300 | 자기 토픽만 (`%u` 치환) | 각 Agent 호스트 |
+
+**Agent 계정명은 반드시 agentId 와 같아야 한다.** §5.2 ACL 이 `%u`(접속 username) 치환에 의존하기 때문이다. agentId 는 Agent 가 스스로 만들지 않고, 기동 스크립트가 채운 환경변수에서 다음 규칙으로 조립된다:
+
+```
+agentId = ${HOSTNAME}_${USER}_J
+```
+
+호스트가 `myhost01`, 구동 계정이 `wasadm` 이면 → **`myhost01_wasadm_J`**
+
+> ⚠️ `agent-001` 같은 **일련번호 형식으로 만들면 안 된다.** Agent 는 `myhost01_wasadm_J` 로 접속하므로 전원 인증에 실패한다. 설계 문서나 예제에서 `agent-001` 표기를 봤다면 그것은 가독성을 위한 약칭이다.
+
+계정을 공유해서도 안 된다. `pattern read cmd/%u/req` 가 모두 같은 토픽으로 풀려 아무 Agent 나 남의 명령을 구독할 수 있다. 평문 구간(§0.1)에서는 이 분리가 피해 범위를 그 Agent 하나로 묶어주는 유일한 장치다.
+
+### 5.2 작업 디렉터리 만들기
+
+평문 비밀번호를 다루므로 **디스크에 쓰지 않는다.** `/dev/shm` 은 메모리 파일시스템이라 재부팅 시 사라진다.
+
+```bash
+export WORK=/dev/shm/mqtt-prov
+mkdir -p "$WORK" && chmod 700 "$WORK" && cd "$WORK"
+pwd
+```
+
+기대 출력:
+```
+/dev/shm/mqtt-prov
+```
+
+> 이후 명령은 **전부 이 디렉터리에서** 실행한다. 중간에 터미널을 닫았다면 `export WORK=/dev/shm/mqtt-prov && cd "$WORK"` 로 다시 들어온다.
+
+### 5.3 인벤토리 파일 작성
+
+Agent 300대의 **(호스트명, 구동 계정)** 쌍이 필요하다. 이 두 값이 agentId 를 결정한다.
+
+**방법 A — 직접 작성**
+
+```bash
+cat > inventory.csv <<'CSV'
+# hostname,user
 myhost01,wasadm
 myhost02,wasadm
-...
+myhost03,appadm
+CSV
 ```
 
-### 5.3 일괄 생성
+**방법 B — 기존 자산 목록에서 변환**
+
+호스트명 목록만 있고 계정이 전부 동일하다면:
 
 ```bash
-IMG=registry.corp.local/mqtt/eclipse-mosquitto:2.0.22
-WORK=/dev/shm/mqtt-prov                  # tmpfs. 디스크에 남기지 않는다
-mkdir -p $WORK && cd $WORK
-: > passwd && chmod 600 passwd           # ★ 먼저 잡아야 경고가 303번 뜨지 않는다
+awk '{print $1",wasadm"}' hostlist.txt > inventory.csv
+```
 
-pwgen() { openssl rand -base64 24; }     # ~144 bit
-add()  { docker run --rm --user "$(id -u):$(id -g)" -v "$WORK:/w" $IMG \
-           mosquitto_passwd -b /w/passwd "$1" "$2"; }
+**방법 C — Agent 호스트에서 직접 수집** (SSH 가능한 경우)
 
-# 운영 계정 3종
-for u in central health ops; do
-  PW=$(pwgen); add "$u" "$PW"; echo "$u,$PW" >> creds.csv
-done
+```bash
+while read -r h; do
+  echo "$h,$(ssh "$h" 'whoami')"
+done < hostlist.txt > inventory.csv
+```
 
-# Agent 300대
+#### 검증 — 여기서 틀리면 전부 다시 만들어야 한다
+
+```bash
+grep -vc '^#' inventory.csv                                    # 300 이어야 한다
+awk -F, '!/^#/{print $1"_"$2"_J"}' inventory.csv | sort | uniq -d   # 출력이 없어야 한다
+```
+
+두 번째 명령은 **agentId 중복 검사**다. 출력이 있으면 같은 호스트에 같은 계정이 두 번 들어간 것이다. 그대로 두면 두 Agent 가 같은 clientId 로 접속해 서로를 강제 종료시키며 무한 재접속 루프에 빠진다. agentId 는 clientId 로도 쓰이며, mosquitto 는 clientId 가 겹치면 뒤에 들어온 쪽이 앞의 세션을 강제 종료(session takeover)시킨다.
+
+### 5.4 생성 스크립트 저장
+
+한 줄씩 복사하지 말고 **파일로 저장해 실행**한다. 아래 블록을 통째로 붙여넣는다.
+
+```bash
+cat > gen-accounts.sh <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORK="$(cd "$(dirname "$0")" && pwd)"
+INV="$WORK/inventory.csv"
+: "${IMG:?IMG 환경변수에 이미지 태그를 지정하세요}"
+
+[ -f "$INV" ] || { echo "인벤토리 파일이 없습니다: $INV" >&2; exit 1; }
+
+: > "$WORK/passwd";    chmod 600 "$WORK/passwd"
+: > "$WORK/creds.csv"; chmod 600 "$WORK/creds.csv"
+
+add() {
+  docker run --rm --user "$(id -u):$(id -g)" -v "$WORK:/w" "$IMG" \
+    mosquitto_passwd -b /w/passwd "$1" "$2"
+  printf '%s,%s\n' "$1" "$2" >> "$WORK/creds.csv"
+}
+
+echo "[1/2] 운영 계정 3종 생성"
+for u in central health ops; do add "$u" "$(openssl rand -base64 24)"; done
+
+echo "[2/2] Agent 계정 생성"
+n=0
 while IFS=, read -r host user; do
+  host="$(echo "$host" | tr -d ' \r')"; user="$(echo "$user" | tr -d ' \r')"
   [ -z "$host" ] && continue
-  AID="${host}_${user}_J"
-  PW=$(pwgen); add "$AID" "$PW"; echo "$AID,$PW" >> creds.csv
-done < /dev/shm/inventory.csv
+  case "$host" in \#*) continue ;; esac
+  add "${host}_${user}_J" "$(openssl rand -base64 24)"
+  n=$((n+1))
+done < "$INV"
 
-wc -l passwd                             # 303 이어야 한다
-cut -d: -f1 passwd | head                # 계정명이 agentId 형식인지 육안 확인
-sudo install -o 1883 -g 1883 -m 600 passwd /srv/mqtt/config/passwd
+echo
+echo "완료: 운영 3 + Agent $n = $((n+3)) 계정"
+SCRIPT
+chmod +x gen-accounts.sh
 ```
 
-> `--user`와 `chmod 600`을 빼면 `mosquitto_passwd` 호출마다 권한 경고 3줄이 출력된다.
-> 303회면 900줄이 쏟아져 **실제 실패를 놓친다.** 위 형태로 실행하면 출력이 없는 것이 정상이다.
+스크립트가 하는 일:
 
-생성 결과는 `username:$7$...` 해시 목록이다. **브로커는 평문을 가진 적이 없다.**
+- 비밀번호는 `openssl rand -base64 24` (~144 bit). 사람이 외울 일이 없으므로 길게 잡는다.
+- `mosquitto_passwd` 는 **브로커 데몬과 별개의 CLI** 다. 브로커가 떠 있지 않아도 동작하므로 설치 전에 실행할 수 있다.
+- `--user "$(id -u):$(id -g)"` 와 `chmod 600` 이 핵심이다. 빼면 호출마다 권한 경고 3줄이 나와 **303회에 900줄**이 쌓이고 실제 실패를 놓친다.
+- 인벤토리의 `#` 주석 줄과 윈도우 개행(`\r`)을 걸러낸다.
 
-### 5.4 배포와 파기
-
-평문 비밀번호와 해시는 **서로 다른 경로로** 나간다 (§5.1).
-
-| 대상 | 주입 방식 |
-|---|---|
-| Agent 300대 | 설정파일 **권한 600, 서비스 계정 소유** |
-| 중앙서버 (`central`) | `.env` 권한 600 또는 파이프라인 시크릿 |
-| `health` | 배포 노드 `.env` (§6.2) |
-
-- **환경변수로 Agent에 주입하지 말 것.** `/proc/<pid>/environ`, `ps e`, 코어덤프, 자식 프로세스로 전파된다.
-- **이미지·jar 하드코딩 금지.** 300대에 같은 값이 박히고 회수가 불가능하다.
-- Java 쪽에서 `MqttConnectionOptions`를 통째로 로그에 찍으면 자격증명이 샌다. `reasonString`만 찍는다 (§16.7).
+### 5.5 실행
 
 ```bash
-shred -u $WORK/creds.csv && rm -rf $WORK    # 배포 완료 직후
+export IMG=registry.corp.local/mqtt/eclipse-mosquitto:2.0.22
+./gen-accounts.sh
 ```
 
-`central`은 계정 1개지만 **가장 강력하다** — `topic write cmd/#`는 300대 전체에 임의 명령을 보낼 수 있다. Agent 자격증명 하나가 새면 그 Agent가 위험하지만, `central`이 새면 전체가 위험하다.
+기대 출력 — **이 네 줄 외에 아무것도 나오지 않아야 한다**:
+```
+[1/2] 운영 계정 3종 생성
+[2/2] Agent 계정 생성
+
+완료: 운영 3 + Agent 300 = 303 계정
+```
+
+| 실패 | 원인 | 조치 |
+|---|---|---|
+| `IMG 환경변수에...` | `export IMG=` 누락 | §5.5 첫 줄 |
+| `Unable to find image` | 이미지 미반입 | §3 |
+| `permission denied ... docker.sock` | docker 그룹 미포함 | `sudo usermod -aG docker $USER` 후 재로그인 |
+| `Warning: File /w/passwd ...` 가 반복 | 스크립트를 수정해 실행 | 원문 그대로 사용 |
+
+### 5.6 결과 확인
+
+```bash
+wc -l < passwd                   # 303
+cut -d: -f1 passwd | head -5     # 계정명 확인
+cut -d: -f1 passwd | tail -3     # Agent 계정명 형식 확인
+head -c 40 passwd; echo          # 해시 형식 확인
+```
+
+기대 출력:
+```
+303
+central
+health
+ops
+myhost01_wasadm_J
+myhost02_wasadm_J
+...
+myhost300_wasadm_J
+central:$7$101$........
+```
+
+`$7$` 로 시작하면 정상이다. **평문은 `passwd` 에 들어가지 않는다** — 브로커는 평문을 가진 적이 없다.
+
+### 5.7 브로커에 설치
+
+```bash
+sudo install -o 1883 -g 1883 -m 600 passwd /srv/mqtt/config/passwd
+ls -l /srv/mqtt/config/passwd
+```
+
+기대 출력 (호스트에 uid 1883 계정이 없으므로 **이름 대신 숫자**로 보이는 것이 정상):
+```
+-rw------- 1 1883 1883 22134 ... /srv/mqtt/config/passwd
+```
+
+### 5.8 자격증명 배포
+
+평문 비밀번호는 `creds.csv` 에 `계정명,비밀번호` 형식으로 들어 있다. 해시(`passwd`)와 평문(`creds.csv`)은 **서로 다른 경로로** 나간다.
+
+#### (1) `health` → 브로커 호스트 `.env`
+
+```bash
+HPW=$(grep '^health,' creds.csv | cut -d, -f2-)
+printf 'MQTT_HEALTH_PW=%s\n' "$HPW" | sudo tee /srv/mqtt/.env >/dev/null
+sudo chmod 600 /srv/mqtt/.env
+sudo ls -l /srv/mqtt/.env
+```
+
+#### (2) `central` → 중앙서버
+
+```bash
+grep '^central,' creds.csv | cut -d, -f2-        # 값 확인 후 중앙서버로 옮긴다
+```
+
+중앙서버에서:
+```bash
+printf 'MQTT_CENTRAL_PW=%s\n' '<위 값>' >> /opt/controller/.env
+chmod 600 /opt/controller/.env
+```
+
+`central` 은 계정 1개지만 **가장 강력하다.** `topic write cmd/#` 는 300대 전체에 임의 명령을 보낼 수 있다. Agent 자격증명 하나가 새면 그 Agent 가 위험하지만, `central` 이 새면 전체가 위험하다.
+
+#### (3) Agent 300대 → `agent.properties`
+
+Agent 는 자기 계정 하나만 받는다. 파일 형식:
+
+```properties
+mqtt.host=10.x.y.10
+mqtt.port=1883
+mqtt.username=myhost01_wasadm_J
+mqtt.password=<해당 Agent 비밀번호>
+```
+
+`username` 은 Agent 가 `${HOSTNAME}_${USER}_J` 로 조립한 값과 같아야 한다. 배포 예시:
+
+```bash
+while IFS=, read -r aid pw; do
+  case "$aid" in central|health|ops) continue ;; esac
+  host="${aid%%_*}"
+  ssh "$host" "umask 077 && printf 'mqtt.username=%s\nmqtt.password=%s\n' '$aid' '$pw' \
+                 >> /opt/agent/agent.properties && chmod 600 /opt/agent/agent.properties"
+done < creds.csv
+```
+
+> 폐쇄망 정책상 SSH 일괄 배포가 불가능하면 배포 파이프라인이나 구성관리 도구를 쓴다. **어느 경우든 파일 권한 600, 서비스 계정 소유**가 조건이다.
+
+배포 시 금지 사항:
+
+- **환경변수 주입 금지.** `/proc/<pid>/environ`, `ps e`, 코어덤프, 자식 프로세스로 전파된다.
+- **이미지·jar 하드코딩 금지.** 300대에 같은 값이 박히고 회수가 불가능하다.
+- Java 쪽에서 `MqttConnectionOptions` 를 통째로 로그에 찍으면 자격증명이 샌다. `reasonString` 만 찍는다.
+
+### 5.9 평문 목록 파기
+
+**배포가 끝나면 즉시 수행한다.**
+
+```bash
+cd "$WORK" && shred -u creds.csv inventory.csv
+cd / && rm -rf "$WORK"
+ls /dev/shm/mqtt-prov      # No such file or directory 여야 한다
+```
+
+`passwd`(해시)는 `/srv/mqtt/config/` 에 설치되어 있으므로 작업 디렉터리를 통째로 지워도 된다.
+
+> 비밀번호를 분실하면 복구할 수 없다. 해당 계정을 §8.1 절차로 재발급한다.
 
 ---
 
+
 ## 6. 배포
+
+> **[호스트] 작업 디렉터리: `/srv/mqtt`**
 
 ### 6.1 `/srv/mqtt/docker-compose.yml`
 
@@ -327,7 +743,7 @@ services:
       - /srv/mqtt/data:/mosquitto/data
       - /srv/mqtt/log:/mosquitto/log
     healthcheck:
-      # central 은 읽기 권한이 없다(§5.2). health 전용 계정을 쓴다
+      # central 은 읽기 권한이 없다(§4.2). health 전용 계정을 쓴다
       test: ["CMD", "mosquitto_sub", "-h", "localhost", "-p", "1883",
              "-u", "health", "-P", "${MQTT_HEALTH_PW}",
              "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
@@ -343,7 +759,7 @@ services:
         limits: { cpus: "2", memory: 2G }
 ```
 
-Agent 300대는 Mosquitto 단일 노드 용량(~10k 커넥션)의 **3% 수준**이다. 1 vCPU / 1 GB로 충분하며 위 값은 여유분이다 (§13).
+Agent 300대는 Mosquitto 단일 노드 용량(~10k 커넥션)의 **3% 수준**이다. 1 vCPU / 1 GB 로 충분하며 위 값은 여유분이다.
 
 ### 6.2 `.env` (권한 600)
 
@@ -354,7 +770,7 @@ ENV
 sudo chmod 600 /srv/mqtt/.env
 ```
 
-> 이 값은 compose 파싱 시점에 컨테이너 설정에 박혀 **`docker inspect`로 평문 노출된다.** 숨기려 애쓰는 대신 **노출돼도 아무것도 못 하는 계정**을 쓴다 — `health`는 `$SYS/broker/uptime` 읽기 권한 하나뿐이다 (§5.1).
+> 이 값은 compose 파싱 시점에 컨테이너 설정에 박혀 **`docker inspect`로 평문 노출된다.** 숨기려 애쓰는 대신 **노출돼도 아무것도 못 하는 계정**을 쓴다 — `health` 는 `$SYS/broker/uptime` 읽기 권한 하나뿐이다(§4.2 ACL).
 
 ### 6.3 기동
 
@@ -382,7 +798,10 @@ mosquitto version 2.0.22 running
 
 ## 7. 설치 검증
 
-`DESIGN.md` §9의 운영판. **순서대로** 진행한다.
+> **실행 위치: 브로커 호스트가 아니라 [운영자 단말] 또는 [Agent 호스트].**
+> 방화벽·네트워크 경로까지 함께 검증해야 하므로, 브로커 안에서 `localhost` 로 테스트하면 의미가 없다.
+
+**순서대로** 진행한다. 앞 단계가 통과해야 다음 단계의 결과를 신뢰할 수 있다.
 
 ### 7.1 경로
 
@@ -411,7 +830,7 @@ mosquitto_sub -h <broker-ip> -p 1883 \
   -u 'hostA_wasadm_J' -P '<pw>' -t 'cmd/hostB_wasadm_J/req' -v
 ```
 
-> ⚠️ **SUBACK으로 판정하지 말 것.** mosquitto는 ACL 위반 구독도 SUBACK 0으로 응답하고 **전달 시점에 차단한다** (§9-3). 반드시 `central`로 해당 토픽에 실제 발행한 뒤 **수신되지 않음**을 확인한다.
+> ⚠️ **SUBACK으로 판정하지 말 것.** mosquitto는 ACL 위반 구독도 SUBACK 0으로 응답하고 **전달 시점에 차단한다.** 반드시 `central`로 해당 토픽에 실제 발행한 뒤 **수신되지 않음**을 확인한다.
 
 ### 7.4 발행 전용 / 구독 전용 강제
 
@@ -433,7 +852,7 @@ mosquitto_pub -h <broker-ip> -p 1883 -u central -P '<pw>' \
 ```
 
 > `mosquitto_pub`의 `-x`는 **session-expiry-interval이지 메시지 만료가 아니다.**
-> `-D PUBLISH message-expiry-interval <초>`가 맞다 (§9-2, 실측으로 확인된 함정).
+> `-D PUBLISH message-expiry-interval <초>` 가 맞다. 실측으로 확인된 함정이다.
 
 Agent 세션을 미리 만들어 둔 상태에서 발행하고, 11초 후 접속시켜 `exp-A`가 **오지 않는지** 확인한다. 만료 이내(예: 3600초)로 보낸 메시지는 전달되어야 한다.
 
@@ -451,7 +870,7 @@ docker compose restart
 # Agent 1대를 붙여놓고 1시간 이상 방치한 뒤 명령 발행
 ```
 
-**건너뛰면 운영 중에 발견하게 된다.** 방화벽·NAT가 유휴 세션을 RST 없이 조용히 버리면, 브로커는 정상 publish + PUBACK을 받지만 Agent에는 도달하지 않는다 (§15.3-a).
+**건너뛰면 운영 중에 발견하게 된다.** 방화벽·NAT가 유휴 세션을 RST 없이 조용히 버리면, 브로커는 정상 publish + PUBACK을 받지만 Agent에는 도달하지 않는다.
 
 ### 7.8 체크리스트
 
@@ -467,6 +886,8 @@ docker compose restart
 ---
 
 ## 8. 운영 절차
+
+> **[호스트] 작업 디렉터리: `/srv/mqtt`** — 일부는 **[호스트 → 일회용 컨테이너]**
 
 ### 8.1 비밀번호 갱신 — 무중단
 
@@ -495,13 +916,13 @@ sudo tar czf mqtt-backup-$(date +%F).tgz -C /srv/mqtt config data
 docker compose start
 ```
 
-`data/mosquitto.db`는 세션과 오프라인 큐다. 유실되면 복구 후 발행분이 **세션이 없어 조용히 폐기된다** (§16.1-B).
+`data/mosquitto.db`는 세션과 오프라인 큐다. 유실되면 복구 후 발행분이 **세션이 없어 조용히 폐기된다.**
 
 ### 8.3 브로커 재시작 시 주의
 
-패치·설정 변경으로 재시작하면 **300대가 동시에 재접속한다.** Agent에 지수 백오프 + `random(0, 5s)` jitter가 들어 있는지 확인한다. Paho의 `setAutomaticReconnect`는 백오프는 하지만 **jitter가 없어 위상이 겹친다** (§13).
+패치·설정 변경으로 재시작하면 **300대가 동시에 재접속한다.** Agent에 지수 백오프 + `random(0, 5s)` jitter가 들어 있는지 확인한다. Paho의 `setAutomaticReconnect`는 백오프는 하지만 **jitter 가 없어 위상이 겹친다.**
 
-평문이라 TLS 핸드셰이크 부하는 없어 **재접속 폭주 자체는 수백 ms 내 완료된다** (§13). 다만 §16.7의 로그 폭증은 그대로 적용되므로 §2.3 로테이션을 확인한다.
+평문이라 TLS 핸드셰이크 부하가 없어 **재접속 폭주 자체는 수백 ms 내 완료된다.** 다만 재접속이 실패 반복으로 이어지면 로그가 폭증하므로 §2.3 로테이션을 확인한다.
 
 ### 8.4 계정 추가 (Agent 증설)
 
@@ -518,24 +939,33 @@ ACL은 `pattern` 기반이라 **수정할 필요가 없다.** 계정만 추가�
 
 ## 9. 트러블슈팅
 
+> **[호스트]** — 마지막 점검 명령 하나만 **[컨테이너 내부]**
+
 | 증상 | 원인 | 조치 |
 |---|---|---|
 | 브로커가 안 뜸 / `refuse to load` | `passwd`·`acl` 권한·소유자 | §2.2. **호스트에서** `chown 1883:1883`, `chmod 600` |
 | `Config loaded` 로그가 없음 | 마운트 경로 불일치 | §6.1 볼륨 경로 확인 |
-| 컨테이너 `unhealthy` 반복 | 헬스체크에 `central` 사용 | `central`은 읽기 권한이 없어 ACL이 거부한다. `health` 계정 (§5.1) |
+| 컨테이너 `unhealthy` 반복 | 헬스체크에 `central` 사용 | `central` 은 읽기 권한이 없어 ACL 이 거부한다. `health` 계정을 쓸 것 (§4.2) |
 | 특정 Agent만 인증 실패 | 계정명 ≠ agentId | §5.1. `${HOSTNAME}_${USER}_J` 와 정확히 일치해야 함 |
 | 명령이 간헐적으로 유실 | 방화벽 idle timeout | §7.7. half-open. idle timeout 상향 |
 | 접속은 되는데 명령이 안 옴 | ACL 위반 (SUBACK은 정상) | §7.3. 전달 시점 차단이라 구독은 성공해 보인다 |
 | 재시작 후 명령이 조용히 사라짐 | `data/` 유실 → 세션 없음 | §8.2 복원 |
-| 두 Agent가 무한 재접속 | clientId 충돌 (session takeover) | 한 계정으로 Agent 2개를 띄운 경우. 운영 규칙 위반 (§2.1) |
-| 디스크 고갈 | 브로커 장기 다운 → 로그 폭증 | §2.3 로테이션 (§16.7) |
+| 두 Agent 가 무한 재접속 | clientId 충돌 (session takeover) | 한 호스트·한 계정으로 Agent 를 두 개 띄운 경우. agentId 가 겹친다 (§5.1) |
+| 디스크 고갈 | 브로커 장기 다운 → 로그 폭증 | §2.3 로테이션 확인 |
 | 미상 프로토콜로 차단 | IPS/DPI 오탐 | §1.1. 평문이라 DPI가 페이로드를 본다. 예외 등록 요청 |
 
+**[호스트]** — 브로커 로그 확인:
 ```bash
-docker compose logs --tail 100 -f
-docker exec mqtt-broker mosquitto_sub -h localhost -u ops -P '<pw>' \
-  -t '$SYS/broker/clients/connected' -C 1      # 현재 접속 수
+cd /srv/mqtt && docker compose logs --tail 100 -f
 ```
+
+**[컨테이너 내부]** — 현재 접속 수 조회. 이 가이드에서 **유일하게 돌고 있는 컨테이너 안에서 실행하는 명령**이다:
+```bash
+docker exec mqtt-broker mosquitto_sub -h localhost -p 1883 \
+  -u ops -P '<ops 비밀번호>' -t '$SYS/broker/clients/connected' -C 1
+```
+
+> `-h localhost` 는 **컨테이너 안에서 본 자기 자신**이다. 호스트에서 같은 명령을 쓰려면 `docker exec` 를 빼고 `-h <브로커 IP>` 로 바꾼다.
 
 ---
 
@@ -543,21 +973,21 @@ docker exec mqtt-broker mosquitto_sub -h localhost -u ops -P '<pw>' \
 
 무중단 전환이 가능하다.
 
-1. 사내 CA에서 서버 인증서 발급 — **SAN에 FQDN과 IP 모두 포함** (§15.4). IP 누락이 가장 흔한 실패다.
-2. 방화벽에 8883 추가 신청 — **1883 신청 시 함께 올려두면 리드타임이 절약된다** (§15.2).
+1. 사내 CA 에서 서버 인증서 발급 — **SAN 에 FQDN 과 IP 를 모두 포함**시킨다. 폐쇄망에서는 DNS 없이 IP 로 접속하는 경우가 잦은데 SAN 에 IP 가 없으면 검증이 실패한다. 가장 흔한 실패 원인이다.
+2. 방화벽에 8883 추가 신청 — **§1.1 에서 1883 을 신청할 때 함께 올려두면 리드타임이 절약된다.**
 3. `mosquitto.conf`에 8883 리스너를 추가한다. `per_listener_settings`가 기본 `false`라 `password_file`·`acl_file`·`allow_anonymous`가 **양쪽 리스너에 그대로 적용된다.**
    ```conf
    listener 8883
    protocol mqtt
    certfile /mosquitto/certs/broker.crt      # 중간 CA 체인 포함
    keyfile  /mosquitto/certs/broker.key
-   require_certificate false                 # mTLS 미사용 (§5.4)
+   require_certificate false                 # mTLS 미사용
    ```
 4. `corp-ca.crt`를 Agent truststore(`keytool -importcert`)와 중앙서버(`tls_set(ca_certs=...)`)에 배포한다.
 5. Agent를 배치별로 8883으로 전환한다.
 6. 전부 넘어간 것을 확인하고 1883 리스너를 삭제, 방화벽도 닫는다.
 
-전환 후에는 §8.3의 재접속 폭주에 TLS 핸드셰이크가 더해진다. ECDSA 인증서 + 세션 재개를 쓰고 jitter를 반드시 확인한다 (§13).
+전환 후에는 §8.3 의 재접속 폭주에 TLS 핸드셰이크가 더해진다. 300대 × RSA-2048 은 약 1초간 코어를 점유하므로 **ECDSA 인증서 + 세션 재개(session resumption)** 를 쓰고 jitter 를 반드시 확인한다.
 
 **인증서 만료일을 자산 목록에 등록한다.** 폐쇄망은 만료 알림이 오지 않아 그대로 서비스가 멈춘다.
 
