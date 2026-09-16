@@ -740,11 +740,13 @@ chmod 600 /opt/controller/.env
 Agent 는 자기 계정 하나만 받는다. 파일 형식:
 
 ```properties
-mqtt.host=10.x.y.10
-mqtt.port=1883
+mqtt.broker.uri=tcp://10.x.y.10:1883
 mqtt.username=myhost01_wasadm_J
 mqtt.password=<해당 Agent 비밀번호>
 ```
+
+> **호스트·포트를 분리하지 말고 URI 한 줄로 둔다.** Paho 는 URI 스킴으로 전송 방식을 결정하므로(`tcp://` / `ws://` / `wss://`), 이 형식이면 나중에 WebSocket 이나 TLS 로 바꿀 때 **설정 한 줄 교체로 끝난다.**
+> `mqtt.host` + `mqtt.port` 로 나눠두면 스킴을 담을 수 없어, Agent 가 코드에서 `"tcp://" + host + ":" + port` 로 조립하게 된다. 그러면 전송 방식 변경이 **jar 재빌드·300대 재배포**가 된다. 지금 형식을 맞춰두는 비용은 0 이다.
 
 `username` 은 Agent 가 `${HOSTNAME}_${USER}_J` 로 조립한 값과 같아야 한다. 배포 예시:
 
@@ -752,7 +754,7 @@ mqtt.password=<해당 Agent 비밀번호>
 while IFS=, read -r aid pw; do
   case "$aid" in central|health|ops) continue ;; esac
   host="${aid%%_*}"
-  ssh "$host" "umask 077 && printf 'mqtt.username=%s\nmqtt.password=%s\n' '$aid' '$pw' \
+  ssh "$host" "umask 077 && printf 'mqtt.broker.uri=tcp://10.x.y.10:1883\nmqtt.username=%s\nmqtt.password=%s\n' '$aid' '$pw' \
                  >> /opt/agent/agent.properties && chmod 600 /opt/agent/agent.properties"
 done < creds.csv
 ```
