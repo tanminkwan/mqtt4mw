@@ -54,21 +54,21 @@
 
 ```
 /sw/docker/mqtt/             ← 설치 루트
-├── docker-compose.yml          §6.1   root:root    644
-├── .env                        §6.2   root:root    600   ← health 비밀번호
-├── config/                     §2.1   1883:1883    700
-│   ├── mosquitto.conf          §4.1   1883:1883    600
-│   ├── acl                     §4.2   1883:1883    600
-│   └── passwd                  §5.7   1883:1883    600   ← 해시 목록
-├── data/                       §2.1   1883:1883    700   ← 세션·오프라인 큐. 백업 대상
+├── docker-compose.yml          §6.1   docker:docker  644
+├── .env                        §6.2   docker:docker  600   ← health 비밀번호, UID/GID
+├── config/                     §2.1   docker:docker  700
+│   ├── mosquitto.conf          §4.1   docker:docker  600
+│   ├── acl                     §4.2   docker:docker  600
+│   └── passwd                  §5.7   docker:docker  600   ← 해시 목록
+├── data/                       §2.1   docker:docker  700   ← 세션·오프라인 큐. 백업 대상
 │   └── mosquitto.db                   컨테이너가 생성한다
-└── log/                        §2.1   1883:1883    700
+└── log/                        §2.1   docker:docker  700
 ```
 
 설치 중에만 존재하는 작업 디렉터리 — **메모리 파일시스템이며 §5.9 에서 파기한다**:
 
 ```
-/dev/shm/mqtt-prov/             §5.2   현재 사용자   700
+/dev/shm/mqtt-prov/             §5.2   docker:docker  700
 ├── inventory.csv                      호스트/계정 목록
 ├── gen-accounts.sh                    계정 생성 스크립트
 ├── passwd                             생성 결과(해시) → /sw/docker/mqtt/config/ 로 이동
@@ -85,7 +85,24 @@
 
 > 로그에 나오는 `/mosquitto/config/...` 는 **컨테이너 안 경로**다. 호스트에서 고칠 때는 `/sw/docker/mqtt/config/...` 로 바꿔 읽는다.
 
-uid/gid **1883** 은 컨테이너 안 `mosquitto` 계정 번호다. **호스트에는 이 계정이 없는 것이 정상이며**, bind mount 는 uid 를 번역하지 않고 숫자만 비교하므로 호스트 파일의 소유자를 1883 으로 맞춰야 한다. `ls -l` 에 이름 대신 숫자가 보이는 것이 정상이다.
+#### 실행 사용자 — root 도 uid 1883 도 쓰지 않는다
+
+**이 가이드는 `sudo` 를 한 번도 쓰지 않는다.** 설치·운영 전 과정을 `docker` 사용자 권한만으로 수행한다.
+
+mosquitto 이미지는 기본적으로 컨테이너 안의 `mosquitto`(uid 1883)로 동작하지만, 그러면 호스트 파일 소유자도 1883 으로 맞춰야 하고 그 `chown` 에 root 가 필요하다. 대신 **컨테이너를 `docker` 사용자의 uid 로 실행한다**(§6.1 `user:`).
+
+```bash
+id -u    # 예: 1001  ← 이 값을 §6.2 .env 에 넣는다
+id -g
+```
+
+그 결과:
+
+- 모든 파일을 `docker` 사용자가 직접 소유한다 → `vi`, `sed` 로 **sudo 없이 수정**된다
+- bind mount 는 uid 를 번역하지 않고 숫자만 비교하므로, 컨테이너 안 프로세스도 같은 uid 라 그대로 읽는다
+- `chmod 600` 이 그대로 유효해 mosquitto 의 권한 경고가 뜨지 않는다 (실측 확인 — 기동 로그에 경고 없음)
+
+> `docker` 사용자가 `docker` 그룹에 속해 있어야 한다. `docker ps` 가 `permission denied` 없이 실행되면 된다.
 
 ---
 
@@ -107,7 +124,7 @@ uid/gid **1883** 은 컨테이너 안 `mosquitto` 계정 번호다. **호스트�
 계정 생성(§5)과 갱신(§8.1)에 이런 명령이 나온다.
 
 ```bash
-docker run --rm --user 1883:1883 -v /sw/docker/mqtt/config:/w <이미지> \
+docker run --rm --user "$(id -u):$(id -g)" -v /sw/docker/mqtt/config:/w <이미지> \
   mosquitto_passwd -b /w/passwd 'myhost01_wasadm_J' '<pw>'
 ```
 
@@ -197,28 +214,30 @@ docker run --rm --user 1883:1883 -v /sw/docker/mqtt/config:/w <이미지> \
 ### 2.1 디렉터리 생성
 
 ```bash
-sudo mkdir -p /sw/docker/mqtt/{config,data,log}
+mkdir -p /sw/docker/mqtt/{config,data,log}
 ```
 
 ### 2.2 소유자와 권한
 
 ```bash
-sudo chown -R 1883:1883 /sw/docker/mqtt        # mqtt 하위만. 상위는 건드리지 않는다
-sudo chmod 700 /sw/docker/mqtt/{config,data,log}
+chmod 700 /sw/docker/mqtt/{config,data,log}
 ```
 
 확인:
 ```bash
 ls -ld /sw/docker/mqtt /sw/docker/mqtt/{config,data,log}
+id -u && id -g        # §6.2 에 넣을 값. 기록해 둔다
 ```
 
-기대 출력 — **소유자가 이름이 아닌 숫자 `1883` 으로 보이는 것이 정상**이다:
+기대 출력 — 소유자가 **`docker`** 여야 한다:
 ```
-drwxr-xr-x 5 1883 1883 4096 ... /sw/docker/mqtt
-drwx------ 2 1883 1883 4096 ... /sw/docker/mqtt/config
-drwx------ 2 1883 1883 4096 ... /sw/docker/mqtt/data
-drwx------ 2 1883 1883 4096 ... /sw/docker/mqtt/log
+drwxr-xr-x 5 docker docker 4096 ... /sw/docker/mqtt
+drwx------ 2 docker docker 4096 ... /sw/docker/mqtt/config
+drwx------ 2 docker docker 4096 ... /sw/docker/mqtt/data
+drwx------ 2 docker docker 4096 ... /sw/docker/mqtt/log
 ```
+
+`/sw/docker` 에 쓰기 권한이 없어 `mkdir` 이 실패하면 **인프라 담당에게 `docker` 사용자 소유의 `/sw/docker/mqtt` 생성을 요청**한다. 이 가이드에서 root 가 필요한 유일한 지점이다.
 
 #### 왜 이 단계를 건너뛰면 안 되는가
 
@@ -269,29 +288,26 @@ Client myhost01_wasadm_J disconnected.
 
 위험한 쪽은 **브로커가 살아 있는데 Agent 가 붙었다 끊기를 반복하는** 경우다. 둘 다 발견이 늦는 장애라 주말을 끼면 그대로 쌓인다. 차는 곳이 `/var/lib/docker` 라 브로커뿐 아니라 **호스트의 다른 컨테이너까지 영향을 받는다.**
 
-컨테이너별 설정은 §6.1 `logging:` 블록에 있고, 여기서는 데몬 기본값을 잡는다.
+#### 이 가이드에서의 조치 — compose 에서 해결한다
 
-```bash
-sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak 2>/dev/null || true
-sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
-{
-  "log-driver": "json-file",
-  "log-opts": { "max-size": "50m", "max-file": "5" }
-}
-JSON
-sudo systemctl restart docker
+데몬 기본값(`/etc/docker/daemon.json`)을 바꾸려면 root 와 `systemctl restart docker` 가 필요하다. **`docker` 사용자 권한으로는 할 수 없고, 필요하지도 않다.**
+
+§6.1 compose 파일의 `logging:` 블록이 브로커 컨테이너를 최대 **250 MB** 로 묶는다:
+
+```yaml
+logging:
+  driver: json-file
+  options: { max-size: "50m", max-file: "5" }
 ```
 
-> ⚠️ `daemon.json` 이 이미 있으면 **덮어쓰지 말고 키만 병합**한다. 위 명령은 백업을 남기지만, 다른 설정(레지스트리 미러 등)이 있었다면 복원해 합쳐야 한다.
-> ⚠️ `systemctl restart docker` 는 **이 호스트의 모든 컨테이너를 재시작한다.** 브로커 설치 전에 수행하는 이유다.
+컨테이너별 설정이 데몬 기본값보다 우선하므로 이것만으로 충분하다. **§2 에서 할 일은 없다.** 기동 후 §6.3 에서 적용 여부를 확인한다:
 
-확인:
 ```bash
-docker info --format '{{.LoggingDriver}}'      # json-file
+docker inspect mqtt-broker --format '{{.HostConfig.LogConfig.Config}}'
+# → map[max-file:5 max-size:50m]     ← map[] 이면 미적용
 ```
 
-> **데몬 설정이 부담스러우면 이 절을 건너뛰어도 된다.** §6.1 compose 파일의 `logging:` 블록만으로 브로커 컨테이너는 최대 250 MB 로 묶인다(`max-size 50m` × `max-file 5`). 데몬 재시작도 필요 없다.
-> 차이는 **호스트의 다른 컨테이너까지 보호할지** 여부다. 이 호스트에서 브로커만 돌린다면 §6.1 만으로 충분하다.
+> 호스트의 **다른 컨테이너**까지 보호하려면 데몬 설정이 필요하다. 이 호스트에 브로커 외 컨테이너가 있고 로그 관리가 안 되고 있다면 **인프라 담당에게 `daemon.json` 설정을 요청**한다. 브로커 설치의 선행 조건은 아니다.
 
 ---
 
@@ -362,7 +378,7 @@ docker run --rm --entrypoint mosquitto <이미지> -h | head -3
 아래 블록을 **통째로** 붙여넣는다.
 
 ```bash
-sudo tee /sw/docker/mqtt/config/mosquitto.conf >/dev/null <<'CONF'
+tee /sw/docker/mqtt/config/mosquitto.conf >/dev/null <<'CONF'
 listener 1883
 protocol mqtt
 
@@ -395,8 +411,7 @@ CONF
 권한 적용:
 
 ```bash
-sudo chown 1883:1883 /sw/docker/mqtt/config/mosquitto.conf
-sudo chmod 600 /sw/docker/mqtt/config/mosquitto.conf
+chmod 600 /sw/docker/mqtt/config/mosquitto.conf
 ```
 
 주요 값의 의미:
@@ -415,7 +430,7 @@ sudo chmod 600 /sw/docker/mqtt/config/mosquitto.conf
 ### 4.2 `acl` 생성
 
 ```bash
-sudo tee /sw/docker/mqtt/config/acl >/dev/null <<'ACL'
+tee /sw/docker/mqtt/config/acl >/dev/null <<'ACL'
 # 컨트롤러: 명령 발행 전용. 읽기 권한 없음
 user central
 topic write cmd/#
@@ -437,11 +452,11 @@ ACL
 권한 적용:
 
 ```bash
-sudo chown 1883:1883 /sw/docker/mqtt/config/acl
-sudo chmod 600 /sw/docker/mqtt/config/acl
+chmod 600 /sw/docker/mqtt/config/acl
 ```
 
-> ⚠️ **`sudo tee` 로 만든 파일은 `root:root 644` 가 된다.** 위 `chown`/`chmod` 를 빼먹으면 §6 기동 시 `world readable permissions` 경고가 뜨고, mosquitto 상위 버전에서는 브로커가 아예 뜨지 않는다.
+> ⚠️ **`tee` 로 만든 파일은 umask 에 따라 `644` 가 된다.** `chmod 600` 을 빼먹으면 §6 기동 시 `world readable permissions` 경고가 뜨고, mosquitto 상위 버전에서는 브로커가 아예 뜨지 않는다.
+> 소유자는 `docker` 사용자 그대로이므로 `chown` 은 필요 없다.
 
 이 ACL 이 강제하는 것:
 
@@ -458,13 +473,13 @@ Warning: ACL pattern 'cmd/broadcast/req' does not contain '%c' or '%u'.
 ### 4.3 배치 확인
 
 ```bash
-sudo ls -l /sw/docker/mqtt/config/
+ls -l /sw/docker/mqtt/config/
 ```
 
-기대 출력 — **소유자가 숫자 `1883`, 권한 `-rw-------`**:
+기대 출력 — **소유자 `docker`, 권한 `-rw-------`**:
 ```
--rw------- 1 1883 1883  426 ... acl
--rw------- 1 1883 1883  692 ... mosquitto.conf
+-rw------- 1 docker docker  426 ... acl
+-rw------- 1 docker docker  692 ... mosquitto.conf
 ```
 
 `passwd` 는 아직 없다. §5 에서 만든다.
@@ -484,13 +499,14 @@ sudo ls -l /sw/docker/mqtt/config/
 ```bash
 docker --version          # Docker 20.10 이상
 openssl version           # 비밀번호 생성에 사용
-sudo -v                   # sudo 권한 확인 (암호 물어보면 입력)
+id -u; id -g              # §6.2 에 넣을 UID/GID
+docker ps >/dev/null && echo 'docker 그룹 OK'
 ls -ld /sw/docker/mqtt/config   # §2 에서 만든 디렉터리
 ```
 
 마지막 명령의 기대 출력:
 ```
-drwx------ 2 1883 1883 4096 ... /sw/docker/mqtt/config
+drwx------ 2 docker docker 4096 ... /sw/docker/mqtt/config
 ```
 
 `No such file or directory` 가 나오면 §2 를 먼저 수행한다.
@@ -644,7 +660,7 @@ export IMG=registry.corp.local/mqtt/eclipse-mosquitto:2.0.22
 |---|---|---|
 | `IMG 환경변수에...` | `export IMG=` 누락 | §5.5 첫 줄 |
 | `Unable to find image` | 이미지 미반입 | §3 |
-| `permission denied ... docker.sock` | docker 그룹 미포함 | `sudo usermod -aG docker $USER` 후 재로그인 |
+| `permission denied ... docker.sock` | `docker` 그룹 미포함 | 인프라 담당에 `usermod -aG docker docker` 요청 후 재로그인 |
 | `Warning: File /w/passwd ...` 가 반복 | 스크립트를 수정해 실행 | 원문 그대로 사용 |
 
 ### 5.6 결과 확인
@@ -674,13 +690,13 @@ central:$7$101$........
 ### 5.7 브로커에 설치
 
 ```bash
-sudo install -o 1883 -g 1883 -m 600 passwd /sw/docker/mqtt/config/passwd
+install -m 600 passwd /sw/docker/mqtt/config/passwd
 ls -l /sw/docker/mqtt/config/passwd
 ```
 
-기대 출력 (호스트에 uid 1883 계정이 없으므로 **이름 대신 숫자**로 보이는 것이 정상):
+기대 출력:
 ```
--rw------- 1 1883 1883 22134 ... /sw/docker/mqtt/config/passwd
+-rw------- 1 docker docker 22134 ... /sw/docker/mqtt/config/passwd
 ```
 
 ### 5.8 자격증명 배포
@@ -691,9 +707,9 @@ ls -l /sw/docker/mqtt/config/passwd
 
 ```bash
 HPW=$(grep '^health,' creds.csv | cut -d, -f2-)
-printf 'MQTT_HEALTH_PW=%s\n' "$HPW" | sudo tee /sw/docker/mqtt/.env >/dev/null
-sudo chmod 600 /sw/docker/mqtt/.env
-sudo ls -l /sw/docker/mqtt/.env
+printf 'MQTT_HEALTH_PW=%s\n' "$HPW" >> /sw/docker/mqtt/.env
+chmod 600 /sw/docker/mqtt/.env
+ls -l /sw/docker/mqtt/.env
 ```
 
 #### (2) `central` → 중앙서버
@@ -768,6 +784,7 @@ services:
   broker:
     image: registry.corp.local/mqtt/eclipse-mosquitto:2.0.22
     container_name: mqtt-broker
+    user: "${MQTT_UID}:${MQTT_GID}"   # ★ docker 사용자로 실행. root/1883 을 쓰지 않는다
     restart: unless-stopped
     ports:
       - "1883:1883"
@@ -796,12 +813,25 @@ Agent 300대는 Mosquitto 단일 노드 용량(~10k 커넥션)의 **3% 수준**�
 
 ### 6.2 `.env` (권한 600)
 
+`health` 비밀번호는 §5.8 에서 이미 넣었다. 여기에 **실행 UID/GID** 를 추가한다.
+
 ```bash
-sudo tee /sw/docker/mqtt/.env >/dev/null <<'ENV'
-MQTT_HEALTH_PW=<health 비밀번호>
-ENV
-sudo chmod 600 /sw/docker/mqtt/.env
+cd /sw/docker/mqtt
+printf 'MQTT_UID=%s\nMQTT_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+chmod 600 .env
+cat .env
 ```
+
+기대 출력:
+```
+MQTT_HEALTH_PW=...
+MQTT_UID=1001
+MQTT_GID=1001
+```
+
+compose 가 같은 디렉터리의 `.env` 를 자동으로 읽어 `user:` 와 healthcheck 에 채운다.
+
+> ⚠️ **`MQTT_UID`/`MQTT_GID` 가 비어 있으면 컨테이너가 root 로 뜬다.** 그러면 `data/` 에 root 소유 파일이 생겨 이후 `docker` 사용자가 백업·삭제할 수 없게 된다. 기동 후 §6.3 에서 반드시 확인한다.
 
 > 이 값은 compose 파싱 시점에 컨테이너 설정에 박혀 **`docker inspect`로 평문 노출된다.** 숨기려 애쓰는 대신 **노출돼도 아무것도 못 하는 계정**을 쓴다 — `health` 는 `$SYS/broker/uptime` 읽기 권한 하나뿐이다(§4.2 ACL).
 
@@ -823,7 +853,30 @@ Opening ipv6 listen socket on port 1883.
 mosquitto version 2.0.22 running
 ```
 
-`Warning: ... world readable permissions`가 보이면 §2.2로 돌아간다.
+`Warning: ... world readable permissions` 가 보이면 §4 의 `chmod 600` 을 확인한다.
+
+#### 실행 사용자와 로그 설정 확인
+
+```bash
+docker inspect mqtt-broker --format 'User={{.Config.User}}'
+docker inspect mqtt-broker --format 'Log={{.HostConfig.LogConfig.Config}}'
+ls -l /sw/docker/mqtt/data/
+```
+
+기대 출력:
+```
+User=1001:1001                      ← 비어 있으면 root 로 뜬 것이다 (§6.2)
+Log=map[max-file:5 max-size:50m]    ← map[] 이면 미적용 (§2.3)
+```
+
+`data/` 는 기동 직후에는 비어 있는 것이 정상이다. `mosquitto.db` 는 `autosave_interval`(30초) 경과 또는 정지 시점에 기록된다. 생성 후 소유자를 확인한다:
+
+```bash
+ls -l /sw/docker/mqtt/data/
+# -rw------- 1 docker docker ... mosquitto.db
+```
+
+`root` 소유로 생겼다면 `.env` 의 UID/GID 가 비어 있었던 것이다. 컨테이너를 내리고(`docker compose down`) **root 소유 파일 삭제를 인프라 담당에 요청한 뒤** §6.2 부터 다시 한다.
 
 **설정 파일은 compose에 파일명으로 나타나지 않는다.** 디렉터리를 통째로 마운트하고(`/sw/docker/mqtt/config:/mosquitto/config:ro`), 이미지 기본 CMD가 `mosquitto -c /mosquitto/config/mosquitto.conf`이기 때문에 경로가 맞물려 적용된다. `Config loaded from ...` 로그로 확인한다.
 
@@ -840,19 +893,18 @@ mosquitto version 2.0.22 running
 
 `mosquitto_sub`/`mosquitto_pub` 가 필요하다. 둘 중 하나를 쓴다.
 
-**방법 A — 패키지 설치** (운영자 단말)
-```bash
-sudo yum install -y mosquitto        # RHEL/CentOS
-sudo apt install -y mosquitto-clients # Debian/Ubuntu
-```
-
-**방법 B — 이미지에서 빌려 쓰기** (폐쇄망에서 패키지 설치가 어려울 때)
+**방법 A — 이미지에서 빌려 쓰기** (권장. 패키지 설치 권한이 필요 없다)
 ```bash
 mqtt() { docker run --rm --network host <이미지> "$@"; }
 mqtt mosquitto_sub --help | head -1
 ```
 
-이하 명령은 `mosquitto_sub ...` 로 적는다. 방법 B 를 쓴다면 앞에 `mqtt ` 를 붙인다.
+**방법 B — 패키지 설치** (root 권한이 있는 운영자 단말에서만)
+```bash
+yum install -y mosquitto           # 설치 권한 필요
+```
+
+이하 명령은 `mosquitto_sub ...` 로 적는다. 방법 A 를 쓴다면 앞에 `mqtt ` 를 붙인다.
 
 #### 검증 전 변수 설정
 
@@ -1059,7 +1111,7 @@ cd /sw/docker/mqtt && docker compose restart
 
 확인:
 ```bash
-sudo ls -l /sw/docker/mqtt/data/mosquitto.db
+ls -l /sw/docker/mqtt/data/mosquitto.db
 ```
 파일이 존재하고 크기가 0 이 아니어야 한다.
 
@@ -1106,7 +1158,7 @@ mosquitto 는 **SIGHUP 으로 `password_file` 을 다시 읽으며 기존 연결
 **① 브로커 쪽 갱신**
 
 ```bash
-sudo docker run --rm --user 1883:1883 -v /sw/docker/mqtt/config:/w \
+docker run --rm --user "$(id -u):$(id -g)" -v /sw/docker/mqtt/config:/w \
   registry.corp.local/mqtt/eclipse-mosquitto:2.0.22 \
   mosquitto_passwd -b /w/passwd '<agentId>' '<새 비밀번호>'
 ```
@@ -1165,7 +1217,7 @@ ssh <호스트> "systemctl restart agent"
 ### 8.2 계정 추가 (Agent 증설)
 
 ```bash
-sudo docker run --rm --user 1883:1883 -v /sw/docker/mqtt/config:/w \
+docker run --rm --user "$(id -u):$(id -g)" -v /sw/docker/mqtt/config:/w \
   registry.corp.local/mqtt/eclipse-mosquitto:2.0.22 \
   mosquitto_passwd -b /w/passwd '<새 agentId>' '<비밀번호>'
 docker kill -s HUP mqtt-broker
@@ -1173,8 +1225,8 @@ docker kill -s HUP mqtt-broker
 
 확인:
 ```bash
-sudo grep -c '' /sw/docker/mqtt/config/passwd        # 계정 수가 1 늘어야 한다
-sudo cut -d: -f1 /sw/docker/mqtt/config/passwd | tail -1
+grep -c '' /sw/docker/mqtt/config/passwd             # 계정 수가 1 늘어야 한다
+cut -d: -f1 /sw/docker/mqtt/config/passwd | tail -1
 ```
 
 **ACL 은 수정할 필요가 없다.** `pattern read cmd/%u/req` 가 계정명으로 자동 치환되므로, 계정만 추가하면 해당 Agent 의 토픽 권한이 바로 생긴다.
@@ -1182,7 +1234,7 @@ sudo cut -d: -f1 /sw/docker/mqtt/config/passwd | tail -1
 ### 8.3 계정 삭제 (Agent 폐기)
 
 ```bash
-sudo docker run --rm --user 1883:1883 -v /sw/docker/mqtt/config:/w \
+docker run --rm --user "$(id -u):$(id -g)" -v /sw/docker/mqtt/config:/w \
   registry.corp.local/mqtt/eclipse-mosquitto:2.0.22 \
   mosquitto_passwd -D /w/passwd '<agentId>'
 docker kill -s HUP mqtt-broker
@@ -1195,7 +1247,7 @@ docker kill -s HUP mqtt-broker
 ```bash
 cd /sw/docker/mqtt
 docker compose stop
-sudo tar czf /var/backups/mqtt-$(date +%F).tgz -C /sw/docker/mqtt config data
+tar czf ~/mqtt-backup-$(date +%F).tgz -C /sw/docker/mqtt config data
 docker compose start
 docker compose ps        # Up (healthy) 확인
 ```
@@ -1209,12 +1261,13 @@ docker compose ps        # Up (healthy) 확인
 ```bash
 cd /sw/docker/mqtt
 docker compose down
-sudo tar xzf /var/backups/mqtt-<날짜>.tgz -C /sw/docker/mqtt
-sudo chown -R 1883:1883 /sw/docker/mqtt/config /sw/docker/mqtt/data
+tar xzf ~/mqtt-backup-<날짜>.tgz -C /sw/docker/mqtt
 docker compose up -d
 ```
 
-`chown` 을 빼먹으면 §2.2 의 권한 경고가 재발한다.
+`tar` 가 권한 비트(600)를 보존하므로 별도 `chmod` 는 필요 없다. 다만 복원 후 `ls -l` 로 한 번 확인한다.
+
+> 백업 파일은 **평문 비밀번호는 없지만 해시와 ACL 을 포함**한다. `~/` 대신 별도 보관소로 옮긴다면 접근 권한을 확인한다.
 
 ### 8.5 브로커 재시작 시 주의
 
@@ -1240,7 +1293,7 @@ cd /sw/docker/mqtt
 docker compose ps                              # Up (healthy)
 docker compose logs --since 24h | grep -ci error
 df -h /var/lib/docker                          # 로그 누적 확인
-sudo ls -lh /sw/docker/mqtt/data/mosquitto.db        # 큐 크기 추이
+ls -lh /sw/docker/mqtt/data/mosquitto.db             # 큐 크기 추이
 ```
 
 `mosquitto.db` 가 계속 커지면 오프라인 Agent 가 쌓이고 있다는 뜻이다. 접속 수(§8.5)와 대조한다.
@@ -1250,51 +1303,40 @@ sudo ls -lh /sw/docker/mqtt/data/mosquitto.db        # 큐 크기 추이
 
 ### 8.7 설정 파일 수정
 
-`mosquitto.conf`·`acl` 은 `1883:1883` 소유에 권한 `600` 이다. **호스트에는 uid 1883 계정이 없으므로 일반 사용자로는 열리지도 않는다:**
+`mosquitto.conf`·`acl` 은 **`docker` 사용자 소유**에 권한 `600` 이다. 본인 파일이므로 **`sudo` 없이 그대로 편집한다.**
 
 ```bash
-cat /sw/docker/mqtt/config/mosquitto.conf
-# → cat: ...: Permission denied
+cd /sw/docker/mqtt/config
+vi mosquitto.conf
 ```
 
-`sudo` 로만 접근할 수 있다. root 는 권한 비트와 무관하게 읽고 쓴다.
+다른 방법:
 
-#### 수정 방법
-
-**방법 A — 편집기** (일부만 고칠 때)
 ```bash
-sudo vi /sw/docker/mqtt/config/mosquitto.conf
-```
+# 한 줄 치환
+sed -i 's/^max_queued_messages .*/max_queued_messages 200/' mosquitto.conf
 
-**방법 B — 전체 교체** (§4.1 처럼 통째로 다시 쓸 때)
-```bash
-sudo tee /sw/docker/mqtt/config/mosquitto.conf >/dev/null <<'CONF'
+# 전체 교체 (§4.1 형식)
+tee mosquitto.conf >/dev/null <<'CONF'
 ... 내용 ...
 CONF
 ```
 
-**방법 C — 한 줄 치환**
-```bash
-sudo sed -i 's/^max_queued_messages .*/max_queued_messages 200/' \
-  /sw/docker/mqtt/config/mosquitto.conf
-```
-
-#### 수정 후 반드시 권한을 다시 확인한다
+#### 수정 후 권한 확인
 
 ```bash
-sudo ls -l /sw/docker/mqtt/config/
+ls -l /sw/docker/mqtt/config/
 ```
 
-기대: `-rw------- 1 1883 1883`
+기대: `-rw------- 1 docker docker`
 
-**`sudo tee` 는 파일을 새로 만들므로 항상 `root:root 644` 가 된다.** 편집기도 저장 방식에 따라 소유자가 root 로 바뀔 수 있다. 어긋나 있으면 되돌린다:
+소유자는 바뀌지 않지만 **권한 비트는 도구에 따라 달라진다.** `tee` 로 새로 만들면 umask 에 따라 `644` 가 되고, 일부 편집기도 저장 시 권한을 재설정한다. 어긋나 있으면:
 
 ```bash
-sudo chown 1883:1883 /sw/docker/mqtt/config/mosquitto.conf
-sudo chmod 600 /sw/docker/mqtt/config/mosquitto.conf
+chmod 600 /sw/docker/mqtt/config/mosquitto.conf
 ```
 
-> 이걸 빠뜨리면 다음 기동에서 `world readable permissions` 경고가 뜨고, mosquitto 상위 버전에서는 **브로커가 아예 뜨지 않는다**(§2.2).
+> 빠뜨리면 다음 기동에서 `world readable permissions` 경고가 뜨고, mosquitto 상위 버전에서는 **브로커가 뜨지 않는다**(§2.2).
 
 #### 반영 방법 — SIGHUP 과 재시작을 구분한다
 
@@ -1312,6 +1354,7 @@ docker kill -s HUP mqtt-broker        # 대부분의 설정. 접속 유지
 | `persistent_client_expiration` | **SIGHUP** |
 | **`listener` 추가·삭제** | **재시작** |
 | **리스너의 TLS 인증서 경로** | **재시작** |
+| **compose 의 `user:`, `logging:`, `ports:`** | **`docker compose up -d`** (컨테이너 재생성) |
 
 리스너를 바꾸고 SIGHUP 을 보내면 조용히 무시되지 않고 다음 오류가 남는다:
 
@@ -1327,16 +1370,22 @@ cd /sw/docker/mqtt && docker compose restart
 docker compose logs --tail 20        # Opening ipv4 listen socket on port ... 확인
 ```
 
+`docker-compose.yml` 자체를 고쳤다면 `restart` 로는 반영되지 않는다. 컨테이너를 다시 만들어야 한다:
+
+```bash
+cd /sw/docker/mqtt && docker compose up -d      # 변경 감지 시 재생성
+```
+
 #### 수정 전 백업
 
 ```bash
-sudo cp -p /sw/docker/mqtt/config/mosquitto.conf \
-           /sw/docker/mqtt/config/mosquitto.conf.$(date +%F)
+cd /sw/docker/mqtt/config
+cp -p mosquitto.conf mosquitto.conf.$(date +%F)
 ```
 
-`-p` 가 소유자와 권한을 함께 보존한다. 되돌릴 때 `chown` 을 다시 할 필요가 없다.
+`-p` 가 소유자와 권한을 함께 보존한다.
 
-> ⚠️ 백업본을 `config/` 안에 두면 브로커가 읽지는 않지만(`-c` 로 지정한 파일만 읽는다) 설정 디렉터리가 지저분해진다. 장기 보관은 `/var/backups/` 로 옮긴다.
+> ⚠️ 백업본을 `config/` 안에 두면 브로커가 읽지는 않지만(`-c` 로 지정한 파일만 읽는다) 디렉터리가 지저분해진다. 장기 보관은 `~/` 등 밖으로 옮긴다.
 
 ---
 
@@ -1347,16 +1396,17 @@ sudo cp -p /sw/docker/mqtt/config/mosquitto.conf \
 
 | 증상 | 원인 | 조치 |
 |---|---|---|
-| 브로커가 안 뜸 / `refuse to load` | `passwd`·`acl` 권한·소유자 | §2.2. **호스트에서** `chown 1883:1883`, `chmod 600` |
+| 브로커가 안 뜸 / `refuse to load` | `passwd`·`acl` 권한 | `chmod 600`. 소유자는 `docker` 여야 한다 (§2.2) |
 | `Config loaded` 로그가 없음 | 마운트 경로 불일치 | §6.1 볼륨 경로 확인 |
 | 컨테이너 `unhealthy` 반복 | 헬스체크에 `central` 사용 | `central` 은 읽기 권한이 없어 ACL 이 거부한다. `health` 계정을 쓸 것 (§4.2) |
 | 특정 Agent만 인증 실패 | 계정명 ≠ agentId | §5.1. `${HOSTNAME}_${USER}_J` 와 정확히 일치해야 함 |
 | 명령이 간헐적으로 유실 | 방화벽 idle timeout | §7.8. half-open. idle timeout 상향 |
 | 접속은 되는데 명령이 안 옴 | ACL 위반 (SUBACK은 정상) | §7.3. 전달 시점 차단이라 구독은 성공해 보인다 |
 | 재시작 후 명령이 조용히 사라짐 | `data/` 유실 → 세션 없음 | §8.4 복원 |
+| `data/` 에 root 소유 파일 | `.env` 의 `MQTT_UID`/`MQTT_GID` 누락 → 컨테이너가 root 로 뜸 | §6.2. 재생성 후 root 파일 삭제는 인프라 담당 요청 |
 | 두 Agent 가 무한 재접속 | clientId 충돌 (session takeover) | 한 호스트·한 계정으로 Agent 를 두 개 띄운 경우. agentId 가 겹친다 (§5.1) |
 | 브로커 호스트 디스크 고갈 | Agent 재접속 반복 → 접속 로그 누적 | §2.3 로테이션. 근본 원인은 §7.8(idle timeout) 또는 clientId 충돌 |
-| 설정 파일이 `Permission denied` | `1883:1883 600` 소유 | `sudo` 로 연다. 호스트에 uid 1883 계정은 없다 (§8.7) |
+| 설정 파일이 `Permission denied` | 소유자가 `docker` 가 아님 | `ls -l` 확인. root 소유면 인프라 담당에 소유권 이전 요청 (§8.7) |
 | 설정을 고쳤는데 반영이 안 됨 | SIGHUP 미전송 또는 리스너 변경 | §8.7. 리스너 추가·삭제는 **재시작**이 필요하다 |
 | SIGHUP 후 `not currently possible to add/remove listeners` | 리스너를 바꾸고 SIGHUP 을 보냄 | `docker compose restart` (§8.7) |
 | 미상 프로토콜로 차단 | IPS/DPI 오탐 | §1.1. 평문이라 DPI 가 페이로드를 본다. 예외 등록 요청 |
